@@ -31,8 +31,9 @@ export default function Home() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Time formatted in English (en-US)
   const formatTime = (dateStr: string) => 
-    new Date(dateStr).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    new Date(dateStr).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
 
   const formatDateLabel = (dateStr: string) => {
     const d = new Date(dateStr);
@@ -131,12 +132,13 @@ export default function Home() {
 
   return (
     <div className="flex h-screen bg-slate-50 font-sans overflow-hidden">
+      {/* English Modern Font */}
       <style jsx global>{`
-        @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700&display=swap');
-        body { font-family: 'Vazirmatn', sans-serif; }
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+        body { font-family: 'Inter', -apple-system, sans-serif; direction: ltr !important; }
       `}</style>
 
-      {/* Sidebar - Hidden on mobile when chat is selected */}
+      {/* Sidebar */}
       <div className={`${(selectedUser || selectedGroup) ? 'hidden md:flex' : 'flex'} w-full md:w-80 bg-white border-r border-slate-200 flex-col shrink-0 shadow-xl z-20`}>
         <div className="p-6 border-b border-slate-100 flex justify-between items-center">
           <div className="flex items-center gap-2">
@@ -156,7 +158,6 @@ export default function Home() {
           
           <p className="text-[10px] font-bold text-slate-400 uppercase px-2 tracking-widest">Messages</p>
           
-          {/* List Item Style Updated */}
           {[...groups, ...users].map((item: any) => {
             const isGroup = !!item.name;
             const isSel = isGroup ? selectedGroup?.id === item.id : selectedUser?.id === item.id;
@@ -209,15 +210,15 @@ export default function Home() {
                     <div className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
                       <div className={`max-w-[85%] md:max-w-[70%] p-3 px-4 rounded-2xl shadow-sm relative ${isMe ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-white text-slate-700 border border-slate-100 rounded-tl-none'}`}>
                         {selectedGroup && !isMe && <p className="text-[10px] font-black mb-1 text-blue-500 uppercase">{users.find(u => u.id === msg.sender_id)?.username.split('@')[0]}</p>}
-                        <p className="text-[14px] leading-relaxed break-words" style={{ direction: 'rtl', textAlign: 'right' }}>{msg.content}</p>
+                        <p className="text-[14px] leading-relaxed break-words" style={{ direction: 'ltr', textAlign: 'left' }}>{msg.content}</p>
                         <div className={`flex items-center gap-1 mt-1 opacity-80 text-[10px] ${isMe ? 'justify-end' : 'justify-start'}`}>
-  <span className={isMe ? 'text-blue-100' : 'text-slate-400'}>{formatTime(msg.created_at)}</span>
-  {isMe && (
-    msg.is_read 
-      ? <CheckCheck size={15} className="text-cyan-300 drop-shadow-sm" strokeWidth={2.5} /> 
-      : <Check size={15} className="text-blue-200" strokeWidth={2.5} />
-  )}
-</div>
+                          <span className={isMe ? 'text-blue-100' : 'text-slate-400'}>{formatTime(msg.created_at)}</span>
+                          {isMe && (
+                            msg.is_read 
+                              ? <CheckCheck size={15} className="text-cyan-300 drop-shadow-sm" strokeWidth={2.5} /> 
+                              : <Check size={15} className="text-blue-200" strokeWidth={2.5} />
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -228,7 +229,7 @@ export default function Home() {
 
             <div className="p-4 md:p-5 bg-white border-t border-slate-200">
               <form onSubmit={sendMessage} className="max-w-4xl mx-auto flex items-center gap-2 bg-slate-100 p-1.5 pl-4 rounded-2xl border border-slate-200 focus-within:ring-2 ring-blue-500/20 transition-all">
-                <input value={newMessage} onChange={(e) => setNewMessage(e.target.value)} placeholder="Type a message..." className="flex-1 bg-transparent border-none outline-none text-slate-700 text-sm py-2" />
+                <input value={newMessage} onChange={(e) => setNewMessage(e.target.value)} placeholder="Type a message..." className="flex-1 bg-transparent border-none outline-none text-slate-700 text-sm py-2" style={{ direction: 'ltr' }} />
                 <button type="submit" disabled={sending} className="bg-blue-600 text-white p-2.5 rounded-xl hover:bg-blue-700 transition-all shadow-md active:scale-95">
                    {sending ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
                 </button>
@@ -244,7 +245,54 @@ export default function Home() {
         )}
       </div>
       
-      {/* Modal Admin / Group - No Changes needed here */}
+      {/* Admin: Add Member Modal */}
+      {showAdminModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-[2rem] p-8 max-w-sm w-full shadow-2xl animate-in zoom-in-95">
+            <h2 className="text-2xl font-black mb-2 text-slate-800">Add Member</h2>
+            <p className="text-slate-500 text-sm mb-6">New members can login with these credentials.</p>
+            <div className="space-y-4">
+              <input id="new-email" type="email" placeholder="Email" className="w-full p-4 bg-slate-50 border border-slate-100 rounded-2xl outline-none" />
+              <input id="new-password" type="password" placeholder="Password" className="w-full p-4 bg-slate-50 border border-slate-100 rounded-2xl outline-none" />
+            </div>
+            <div className="flex gap-3 mt-8">
+              <button onClick={async () => {
+                const email = (document.getElementById('new-email') as HTMLInputElement).value;
+                const password = (document.getElementById('new-password') as HTMLInputElement).value;
+                if (!email || !password) return;
+                const { error } = await supabase.auth.signUp({ email, password });
+                if (!error) { alert('Member added!'); setShowAdminModal(false); } else { alert(error.message); }
+              }} className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-bold shadow-lg">Create</button>
+              <button onClick={() => setShowAdminModal(false)} className="flex-1 py-4 text-slate-400 font-bold">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New Group Modal */}
+      {showGroupModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-[2rem] p-8 max-w-sm w-full shadow-2xl animate-in zoom-in-95">
+            <h2 className="text-2xl font-black mb-6 text-slate-800">New Group</h2>
+            <input value={newGroupName} onChange={(e) => setNewGroupName(e.target.value)} placeholder="Group Name" className="w-full p-4 bg-slate-50 border border-slate-100 rounded-2xl outline-none mb-4" />
+            <div className="flex gap-3 mt-4">
+              <button onClick={async () => {
+                if (!newGroupName) return;
+                const { data: group } = await supabase.from('groups').insert([{ name: newGroupName, created_by: currentUser.id }]).select().single();
+                if (group) {
+                  const members = users.map(u => ({ group_id: group.id, user_id: u.id }));
+                  members.push({ group_id: group.id, user_id: currentUser.id });
+                  await supabase.from('group_members').insert(members);
+                  setGroups([...groups, group]);
+                  setShowGroupModal(false);
+                  setNewGroupName('');
+                }
+              }} className="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-bold shadow-lg">Create</button>
+              <button onClick={() => setShowGroupModal(false)} className="flex-1 py-4 text-slate-400 font-bold">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
