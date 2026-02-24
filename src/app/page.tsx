@@ -2,12 +2,13 @@
 
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { supabase } from '@/lib/supabase';
+import { cache } from '@/lib/cache';
 import { useRouter } from 'next/navigation';
 import {
   Send, User, LogOut, MessageSquare, Loader2, ShieldCheck, Users,
   Check, CheckCheck, ChevronLeft, Settings, UserCircle, Plus, Trash2,
   Camera, Edit3, X, ImageIcon, FileImage, Search, Crown, ArrowLeft,
-  Reply, CornerUpLeft, Pencil, WifiOff, Wifi,
+  Reply, CornerUpLeft, Pencil, WifiOff, Wifi, RefreshCw,
 } from 'lucide-react';
 
 
@@ -78,14 +79,9 @@ export default function Home() {
   const [msgSearch, setMsgSearch]   = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
 
-  // ── Reply state ────────────────────────────────────────────────────────────
-  const [replyTo, setReplyTo] = useState<any>(null); // message being replied to
-
-  // ── Edit state ─────────────────────────────────────────────────────────────
-  const [editingMsg, setEditingMsg] = useState<any>(null); // message being edited
+  const [replyTo, setReplyTo] = useState<any>(null);
+  const [editingMsg, setEditingMsg] = useState<any>(null);
   const [editContent, setEditContent] = useState('');
-
-  // ── Context menu state ─────────────────────────────────────────────────────
   const [ctxMenu, setCtxMenu] = useState<{msg:any; x:number; y:number} | null>(null);
 
   const [showAddMember, setShowAddMember] = useState(false);
@@ -111,6 +107,9 @@ export default function Home() {
     const saved = localStorage.getItem('realInternetCheck');
     return saved === null ? true : saved === 'true';
   });
+
+  // وقتی آفلاین بودیم و آنلاین شدیم sync کنیم
+  const [needsSync, setNeedsSync] = useState(false);
 
   const toggleRealCheck = () => {
     const v = !realInternetCheck;
@@ -140,6 +139,7 @@ export default function Home() {
   };
 
   const refreshUnread = async (uid:string) => {
+    if (!isOnline) return;
     const { data } = await supabase.from('messages').select('sender_id')
       .eq('receiver_id',uid).eq('is_read',false);
     const m:Record<string,number> = {};
@@ -156,52 +156,159 @@ export default function Home() {
     }
   },[ctxMenu]);
 
-  // ── INIT ──────────────────────────────────────────────────────────────────
+  // ── browser online/offline events ────────────────────────────────────────
+  useEffect(()=>{
+    const goOnline  = () => { setIsOnline(true);  setNeedsSync(true); };
+    const goOffline = () => { setIsOnline(false); setOnlineIds(new Set()); };
+    window.addEventListener('online',  goOnline);
+    window.addEventListener('offline', goOffline);
+    // وضعیت اولیه
+    setIsOnline(navigator.onLine);
+    return ()=>{
+      window.removeEventListener('online',  goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  },[]);
+
+  // ── sync وقتی اینترنت برگشت ────────────────────────────────────────────
+  useEffect(()=>{
+    if (!needsSync || !currentUser || !isOnline) return;
+    setNeedsSync(false);
+    syncFromServer();
+  },[needsSync, currentUser, isOnline]);
+
+  // ── INIT: ابتدا از کش بخون، بعد از سرور ──────────────────────────────────
   useEffect(()=>{
     const init = async () => {
+      // ── 1. بررسی session در Supabase (یا از IndexedDB) ──────────────────
       const { data:{session} } = await supabase.auth.getSession();
-      if (!session){ router.push('/login'); return; }
-      const user = session.user;
-      setCU(user); cuRef.current = user;
 
-      const { data:prof } = await supabase.from('profiles').select('*').eq('id',user.id).single();
-      setProfile(prof);
-      const amAdmin = prof?.is_admin||false;
-      setIsAdmin(amAdmin);
-
-      const { data:others } = await supabase.from('profiles').select('*').neq('id',user.id);
-      const otherList = others||[];
-      setUsers(otherList);
-
-      const ids = new Set<string>(otherList.map((p:any)=>p.id));
-      ids.add(user.id);
-      knownUserIdsRef.current = ids;
-
-      if (amAdmin) {
-        adminIdRef.current = user.id;
-        setAllowFiles(prof?.settings_allow_files||false);
-      } else {
-        const adminProf = otherList.find((p:any)=>p.is_admin);
-        if (adminProf) {
-          adminIdRef.current = adminProf.id;
-          setAllowFiles(adminProf.settings_allow_files||false);
+      if (!session) {
+        // آفلاینیم؟ کش session رو چک کن
+        const cachedSession = await cache.getSession().catch(()=>null);
+        if (cachedSession) {
+          // فقط از کش لود کن
+          await loadFromCache(cachedSession.userId, cachedSession.userData);
+          setIsOnline(false);
+          setLoading(false);
+          return;
         }
+        router.push('/login');
+        return;
       }
 
-      const { data:grps } = await supabase.from('groups').select('*');
-      setGroups(grps||[]);
-      await refreshUnread(user.id);
+      const user = session.user;
+      setCU(user); cuRef.current = user;
+      // session رو ذخیره کن
+      await cache.saveSession(user.id, user).catch(()=>{});
+
+      // ── 2. اول از کش بخون تا UI سریع نشون داده بشه ──────────────────────
+      await loadFromCache(user.id, user);
       setLoading(false);
+
+      // ── 3. در پس‌زمینه از سرور sync کن ──────────────────────────────────
+      if (navigator.onLine) {
+        await syncFromServer();
+      }
     };
     init();
   },[router]);
+
+  // ── Load از IndexedDB ─────────────────────────────────────────────────────
+  const loadFromCache = async (userId: string, user: any) => {
+    try {
+      const [cachedProfiles, cachedGroups] = await Promise.all([
+        cache.getProfiles(),
+        cache.getGroups(),
+      ]);
+
+      if (cachedProfiles.length > 0) {
+        const myProf = cachedProfiles.find((p:any) => p.id === userId);
+        if (myProf) {
+          setProfile(myProf);
+          setIsAdmin(myProf.is_admin || false);
+          setAllowFiles(myProf.settings_allow_files || false);
+        }
+        const others = cachedProfiles.filter((p:any) => p.id !== userId);
+        setUsers(others);
+
+        const ids = new Set<string>(cachedProfiles.map((p:any) => p.id));
+        knownUserIdsRef.current = ids;
+
+        // پیدا کردن admin برای allowFiles
+        if (!(myProf?.is_admin)) {
+          const adminProf = others.find((p:any) => p.is_admin);
+          if (adminProf) {
+            adminIdRef.current = adminProf.id;
+            setAllowFiles(adminProf.settings_allow_files || false);
+          }
+        } else {
+          adminIdRef.current = userId;
+        }
+      }
+
+      if (cachedGroups.length > 0) {
+        setGroups(cachedGroups);
+      }
+    } catch (err) {
+      console.warn('[Cache] loadFromCache error:', err);
+    }
+  };
+
+  // ── Sync از Supabase و ذخیره در کش ───────────────────────────────────────
+  const syncFromServer = async () => {
+    const cu = cuRef.current;
+    if (!cu) return;
+    try {
+      const [{ data: profData }, { data: grpData }] = await Promise.all([
+        supabase.from('profiles').select('*'),
+        supabase.from('groups').select('*'),
+      ]);
+
+      if (profData) {
+        await cache.saveProfiles(profData);
+        const myProf = profData.find((p:any) => p.id === cu.id);
+        if (myProf) {
+          setProfile(myProf);
+          setIsAdmin(myProf.is_admin || false);
+          if (myProf.is_admin) {
+            adminIdRef.current = cu.id;
+            setAllowFiles(myProf.settings_allow_files || false);
+          }
+        }
+        const others = profData.filter((p:any) => p.id !== cu.id);
+        setUsers(others);
+        const ids = new Set<string>(profData.map((p:any) => p.id));
+        knownUserIdsRef.current = ids;
+
+        if (!(myProf?.is_admin)) {
+          const adminProf = others.find((p:any) => p.is_admin);
+          if (adminProf) {
+            adminIdRef.current = adminProf.id;
+            setAllowFiles(adminProf.settings_allow_files || false);
+          }
+        }
+      }
+
+      if (grpData) {
+        await cache.saveGroups(grpData);
+        setGroups(grpData);
+      }
+
+      await refreshUnread(cu.id);
+    } catch (err) {
+      console.warn('[Sync] syncFromServer error:', err);
+    }
+  };
 
   // ── REALTIME: profiles ─────────────────────────────────────────────────────
   useEffect(()=>{
     if (!currentUser) return;
     const ch = supabase.channel('profiles-live')
-      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'profiles'},(payload)=>{
+      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'profiles'},async(payload)=>{
         const updated = payload.new as any;
+        // کش رو آپدیت کن
+        await cache.updateProfile(updated).catch(()=>{});
         if (updated.id === adminIdRef.current) {
           setAllowFiles(updated.settings_allow_files||false);
         }
@@ -231,6 +338,8 @@ export default function Home() {
         const su  = selUserRef.current;
         const sg  = selGrpRef.current;
         if (!cu) return;
+        // ذخیره در کش
+        await cache.upsertMessage(msg).catch(()=>{});
         const inView = sg
           ? String(msg.group_id)===String(sg.id)
           : su && (msg.sender_id===su.id||msg.sender_id===cu.id);
@@ -242,19 +351,19 @@ export default function Home() {
           setUnread(prev=>({...prev,[msg.sender_id]:(prev[msg.sender_id]||0)+1}));
         }
       })
-      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'messages'},(p)=>{
+      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'messages'},async(p)=>{
+        await cache.upsertMessage(p.new).catch(()=>{});
         setMessages(prev=>prev.map(m=>m.id===p.new.id?{...m,...p.new}:m));
       })
-      .on('postgres_changes',{event:'DELETE',schema:'public',table:'messages'},(p)=>{
+      .on('postgres_changes',{event:'DELETE',schema:'public',table:'messages'},async(p)=>{
+        await cache.deleteMessage(p.old.id).catch(()=>{});
         setMessages(prev=>prev.filter(m=>m.id!==p.old.id));
       })
       .subscribe((status)=>{
         if (status === 'SUBSCRIBED') {
-          // آنلاین — channel وصل شد
           setIsOnline(true);
           ch.track({online_at:new Date().toISOString()});
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          // آفلاین یا خطا
           if (realInternetCheck) setIsOnline(false);
           setOnlineIds(new Set());
         }
@@ -264,18 +373,34 @@ export default function Home() {
 
   useEffect(()=>{ scrollRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
 
-  // ── Fetch messages ─────────────────────────────────────────────────────────
+  // ── Fetch messages: اول کش، بعد سرور ─────────────────────────────────────
   const selUserId  = selUser?.id  ?? null;
   const selGrpId   = selGroup?.id ?? null;
 
   const fetchMessages = useCallback(async()=>{
     const cu = cuRef.current;
     if (!cu||(!selUserId&&!selGrpId)){ setMessages([]); return; }
+
+    // ── ابتدا از کش بخون (فوری) ─────────────────────────────────────────
+    try {
+      const cached = selGrpId
+        ? await cache.getGroupMessages(String(selGrpId))
+        : await cache.getDirectMessages(cu.id, String(selUserId));
+      if (cached.length > 0) setMessages(cached);
+    } catch {}
+
+    // ── بعد از سرور sync کن (اگر آنلاین) ──────────────────────────────
+    if (!navigator.onLine) return;
+
     let q = supabase.from('messages').select('*');
     if (selGrpId) q=q.eq('group_id',selGrpId);
     else q=q.or(`and(sender_id.eq.${cu.id},receiver_id.eq.${selUserId}),and(sender_id.eq.${selUserId},receiver_id.eq.${cu.id})`);
     const { data,error } = await q.order('created_at',{ascending:true});
-    if (!error) setMessages(data||[]);
+    if (!error && data) {
+      setMessages(data);
+      // ذخیره همه پیام‌ها در کش
+      await cache.saveMessages(data).catch(()=>{});
+    }
     if (selUserId){
       await supabase.from('messages').update({is_read:true})
         .eq('sender_id',selUserId).eq('receiver_id',cu.id).eq('is_read',false);
@@ -316,8 +441,8 @@ export default function Home() {
   // ── Delete message ─────────────────────────────────────────────────────────
   const deleteMsg = async(msg:any)=>{
     if(!currentUser||msg.sender_id!==currentUser.id) return;
+    await cache.deleteMessage(msg.id).catch(()=>{});
     await supabase.from('messages').delete().eq('id',msg.id);
-    // realtime DELETE event will remove it from state
   };
 
   // ── Edit message ───────────────────────────────────────────────────────────
@@ -331,11 +456,13 @@ export default function Home() {
   const saveEdit = async(e:React.FormEvent)=>{
     e.preventDefault();
     if(!editContent.trim()||!editingMsg) return;
+    const patch = {content:editContent,edited_at:new Date().toISOString()};
+    await cache.updateMessage(editingMsg.id, patch).catch(()=>{});
     const {error}=await supabase.from('messages')
-      .update({content:editContent,edited_at:new Date().toISOString()})
+      .update(patch)
       .eq('id',editingMsg.id);
     if(!error){
-      setMessages(prev=>prev.map(m=>m.id===editingMsg.id?{...m,content:editContent,edited_at:new Date().toISOString()}:m));
+      setMessages(prev=>prev.map(m=>m.id===editingMsg.id?{...m,...patch}:m));
     }
     setEditingMsg(null);
     setEditContent('');
@@ -347,8 +474,6 @@ export default function Home() {
   const openCtxMenu=(e:React.MouseEvent,msg:any)=>{
     e.preventDefault();
     e.stopPropagation();
-    const isMe = currentUser && msg.sender_id===currentUser.id;
-    // Only show menu if there's something to do
     setCtxMenu({msg,x:e.clientX,y:e.clientY});
   };
 
@@ -368,7 +493,10 @@ export default function Home() {
       const {data:{publicUrl}}=supabase.storage.from('chat-media').getPublicUrl(path);
       const {error:dbErr}=await supabase.from('profiles').update({avatar_url:publicUrl}).eq('id',currentUser.id);
       if(dbErr){ console.error('Profile update error:',dbErr.message); }
-      else { setProfile((p:any)=>({...p,avatar_url:publicUrl})); }
+      else {
+        setProfile((p:any)=>({...p,avatar_url:publicUrl}));
+        await cache.updateProfile({...profile,avatar_url:publicUrl}).catch(()=>{});
+      }
     }
     e.target.value='';
   };
@@ -400,6 +528,9 @@ export default function Home() {
     if(toAdd.length) await supabase.from('group_members').insert(toAdd.map(uid=>({group_id:editGrp.id,user_id:uid})));
     if(toDel.length) await supabase.from('group_members').delete().eq('group_id',editGrp.id).in('user_id',toDel);
     setEditGrp(null);
+    // sync groups cache
+    const {data:grpData} = await supabase.from('groups').select('*');
+    if(grpData) { await cache.saveGroups(grpData); setGroups(grpData); }
   };
 
   const createGrp=async()=>{
@@ -409,14 +540,18 @@ export default function Home() {
     if(error||!g) return;
     const rows=[...grpMembers.map(uid=>({group_id:g.id,user_id:uid})),{group_id:g.id,user_id:currentUser.id}];
     await supabase.from('group_members').insert(rows);
-    setGroups(prev=>[...prev,g]);
+    const newGroups = [...groups,g];
+    setGroups(newGroups);
+    await cache.saveGroups(newGroups).catch(()=>{});
     setEditGrp(null); setEditGrpName(''); setGrpMembers([]);
   };
 
   const deleteGrp=async(id:string)=>{
     if(!confirm('Delete this group?')) return;
     await supabase.from('groups').delete().eq('id',id);
-    setGroups(prev=>prev.filter(g=>g.id!==id));
+    const newGroups = groups.filter(g=>g.id!==id);
+    setGroups(newGroups);
+    await cache.saveGroups(newGroups).catch(()=>{});
   };
 
   // ── User CRUD ──────────────────────────────────────────────────────────────
@@ -427,7 +562,9 @@ export default function Home() {
     const {error}=await supabase.from('profiles')
       .update({full_name:editUsrName,is_admin:editUsrAdmin}).eq('id',editUsr.id);
     if(!error){
-      setUsers(prev=>prev.map(u=>u.id===editUsr.id?{...u,full_name:editUsrName,is_admin:editUsrAdmin}:u));
+      const updated = {...editUsr,full_name:editUsrName,is_admin:editUsrAdmin};
+      setUsers(prev=>prev.map(u=>u.id===editUsr.id?updated:u));
+      await cache.updateProfile(updated).catch(()=>{});
     } else { alert('Save failed: '+error.message); }
     setEditUsr(null);
   };
@@ -441,7 +578,12 @@ export default function Home() {
   const saveName=async()=>{
     if(!newFullName.trim()||!currentUser) return;
     const {error}=await supabase.from('profiles').update({full_name:newFullName}).eq('id',currentUser.id);
-    if(!error){ setProfile((p:any)=>({...p,full_name:newFullName})); setEditingName(false); }
+    if(!error){
+      const updated = {...profile,full_name:newFullName};
+      setProfile(updated);
+      await cache.updateProfile(updated).catch(()=>{});
+      setEditingName(false);
+    }
   };
 
   const addMember=async()=>{
@@ -449,6 +591,13 @@ export default function Home() {
     const {error}=await supabase.auth.signUp({email:newEmail,password:newPass});
     if(!error){ setShowAddMember(false); setNewEmail(''); setNewPass(''); alert('Member added!'); }
     else alert(error.message);
+  };
+
+  // ── Manual refresh (pull to refresh feel) ────────────────────────────────
+  const manualSync = async () => {
+    if (!isOnline) return;
+    await syncFromServer();
+    await fetchMessages();
   };
 
   // ── Message search ─────────────────────────────────────────────────────────
@@ -462,7 +611,6 @@ export default function Home() {
     return text.replace(new RegExp(`(${esc})`,'gi'),'<mark class="hl">$1</mark>');
   };
 
-  // Helper: get reply preview info
   const getReplyPreview=(msg:any)=>{
     if(!msg.reply_to) return null;
     const orig = messages.find(m=>m.id===msg.reply_to);
@@ -489,6 +637,7 @@ export default function Home() {
           <MessageSquare className="text-white" size={28}/>
         </div>
         <Loader2 className="animate-spin" size={20} style={{color:'#6366f1'}}/>
+        <p className="text-xs" style={{color:'#4b5563'}}>Loading from cache…</p>
       </div>
     </div>
   );
@@ -523,7 +672,6 @@ export default function Home() {
     </button>
   );
 
-  // ── Reply preview bar (inside input area) ──────────────────────────────────
   const ReplyBar=()=>{
     if(!replyTo) return null;
     const senderName = replyTo.sender_id===currentUser?.id
@@ -546,7 +694,6 @@ export default function Home() {
     );
   };
 
-  // ── Edit bar (inside input area) ───────────────────────────────────────────
   const EditBar=()=>{
     if(!editingMsg) return null;
     return (
@@ -560,6 +707,24 @@ export default function Home() {
       </div>
     );
   };
+
+  // ── بنر آفلاین با دکمه Retry ──────────────────────────────────────────────
+  const OfflineBanner = () => (
+    <div className="flex items-center justify-between gap-2 px-4 py-2 shrink-0"
+      style={{background:"rgba(239,68,68,0.12)",borderBottom:"1px solid rgba(239,68,68,0.2)"}}>
+      <div className="flex items-center gap-2">
+        <WifiOff size={14} style={{color:"#f87171",flexShrink:0}}/>
+        <p className="text-xs font-medium" style={{color:"#f87171"}}>
+          آفلاین — نمایش از کش محلی
+        </p>
+      </div>
+      <button onClick={manualSync}
+        className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs"
+        style={{background:'rgba(239,68,68,0.15)',color:'#f87171'}}>
+        <RefreshCw size={11}/> Retry
+      </button>
+    </div>
+  );
 
   return (
     <div className="flex flex-col h-screen overflow-hidden"
@@ -585,25 +750,21 @@ export default function Home() {
           font-size:13px;cursor:pointer;transition:background 0.12s;}
       `}</style>
 
-
       {/* ═══════════ CONTEXT MENU ══════════════════════════════════════ */}
       {ctxMenu&&(
         <div className="ctx-menu" onClick={e=>e.stopPropagation()}
           style={{left:Math.min(ctxMenu.x,window.innerWidth-180),top:Math.min(ctxMenu.y,window.innerHeight-160),
             background:T.ctxMenu,border:`1px solid ${T.ctxBorder}`}}>
-          {/* Reply — always available */}
           <div className="ctx-item" style={{color:'#818cf8'}}
             onClick={()=>{ setReplyTo(ctxMenu.msg); setCtxMenu(null); inputRef.current?.focus(); }}>
             <Reply size={15}/> Reply
           </div>
-          {/* Edit — only own text messages */}
           {currentUser&&ctxMenu.msg.sender_id===currentUser.id&&!ctxMenu.msg.is_image&&(
             <div className="ctx-item" style={{color:'#14b8a6'}}
               onClick={()=>startEdit(ctxMenu.msg)}>
               <Pencil size={15}/> Edit
             </div>
           )}
-          {/* Delete — only own messages */}
           {currentUser&&ctxMenu.msg.sender_id===currentUser.id&&(
             <div className="ctx-item" style={{color:'#f87171'}}
               onClick={()=>{ deleteMsg(ctxMenu.msg); setCtxMenu(null); }}>
@@ -616,8 +777,6 @@ export default function Home() {
       {/* ═══════════════ CHAT VIEW ═══════════════════════════════════ */}
       {inChat && (
         <div className="flex flex-col h-full">
-
-          {/* Header */}
           <div className="flex items-center gap-3 px-4 py-3 shrink-0 t"
             style={{background:T.header,borderBottom:`1px solid ${T.border}`,backdropFilter:'blur(20px)'}}>
             <button onClick={()=>{setSelUser(null);setSelGroup(null);setMediaPrev(null);setSearchOpen(false);setMsgSearch('');setReplyTo(null);setEditingMsg(null);}}
@@ -649,7 +808,6 @@ export default function Home() {
             <ThemeToggle/>
           </div>
 
-          {/* Search bar */}
           {searchOpen && (
             <div className="px-4 py-2 shrink-0 t" style={{background:T.header,borderBottom:`1px solid ${T.border}`}}>
               <div className="flex items-center gap-2 px-3 rounded-xl t"
@@ -664,17 +822,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* Offline banner */}
-          {!isOnline&&(
-            <div className="flex items-center justify-between gap-2 px-4 py-2 shrink-0"
-              style={{background:"rgba(239,68,68,0.12)",borderBottom:"1px solid rgba(239,68,68,0.2)"}}>
-              <div className="flex items-center gap-2">
-                <WifiOff size={14} style={{color:"#f87171",flexShrink:0}}/>
-                <p className="text-xs font-medium" style={{color:"#f87171"}}>آفلاین — ارسال پیام غیرفعال است</p>
-              </div>
-
-            </div>
-          )}
+          {!isOnline && <OfflineBanner/>}
 
           {/* Messages */}
           <div className="flex-1 overflow-y-auto px-4 py-4 t" style={{background:T.bg}}
@@ -682,7 +830,9 @@ export default function Home() {
             {messages.length===0&&(
               <div className="flex flex-col items-center justify-center h-full gap-2 opacity-30">
                 <MessageSquare size={32} style={{color:T.textSub}}/>
-                <p className="text-sm" style={{color:T.textSub}}>No messages yet</p>
+                <p className="text-sm" style={{color:T.textSub}}>
+                  {isOnline ? 'No messages yet' : 'No cached messages'}
+                </p>
               </div>
             )}
             {msgSearch.trim()&&filteredMsgs.length===0&&messages.length>0&&(
@@ -707,8 +857,6 @@ export default function Home() {
                     </div>
                   )}
                   <div className={`flex mb-1.5 ${isMe?'justify-end':'justify-start'} items-end gap-1`}>
-
-                    {/* Floating action buttons — left side for own msgs */}
                     {isMe&&(
                       <div className="msg-actions flex items-center gap-1 mb-1">
                         <button onClick={(e)=>openCtxMenu(e,msg)}
@@ -718,23 +866,14 @@ export default function Home() {
                         </button>
                       </div>
                     )}
-
                     <div style={{maxWidth:'78%',overflow:'hidden'}}>
-
-                      {/* Reply preview bubble */}
                       {replyPrev&&(
                         <div className={`mb-1 px-3 py-2 rounded-xl ${isMe?'ml-auto':'mr-auto'}`}
-                          style={{
-                            background:T.replyBg,
-                            borderLeft:`3px solid ${T.replyBorder}`,
-                            maxWidth:'100%',
-                          }}>
+                          style={{background:T.replyBg,borderLeft:`3px solid ${T.replyBorder}`,maxWidth:'100%'}}>
                           <p className="text-[10px] font-semibold mb-0.5" style={{color:'#818cf8'}}>{replyPrev.senderName}</p>
                           <p className="text-xs truncate" style={{color:T.textSub}}>{replyPrev.text}</p>
                         </div>
                       )}
-
-                      {/* Message bubble */}
                       <div
                         onContextMenu={(e)=>openCtxMenu(e,msg)}
                         style={{
@@ -776,8 +915,6 @@ export default function Home() {
                         )}
                       </div>
                     </div>
-
-                    {/* Floating reply button — right side for others' msgs */}
                     {!isMe&&(
                       <div className="msg-actions flex items-center gap-1 mb-1">
                         <button onClick={()=>{setReplyTo(msg);inputRef.current?.focus();}}
@@ -794,13 +931,9 @@ export default function Home() {
             <div ref={scrollRef}/>
           </div>
 
-          {/* Edit bar */}
           <EditBar/>
-
-          {/* Reply bar */}
           {!editingMsg&&<ReplyBar/>}
 
-          {/* Media preview */}
           {mediaPrev&&(
             <div className="px-4 pt-2 shrink-0 t" style={{background:T.header,borderTop:`1px solid ${T.border}`}}>
               <div className="flex items-center gap-2 p-2 rounded-2xl" style={card}>
@@ -818,9 +951,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* Input */}
           <div className="px-4 py-3 shrink-0 t" style={{background:T.header,borderTop:`1px solid ${T.border}`}}>
-            {/* Edit mode */}
             {editingMsg?(
               <form onSubmit={saveEdit} className="flex items-center gap-2">
                 <div className="flex-1 flex items-center px-4 rounded-2xl t"
@@ -841,7 +972,6 @@ export default function Home() {
                 </button>
               </form>
             ):(
-              /* Normal send mode */
               <form onSubmit={sendMsg} className="flex items-center gap-2">
                 {allowFiles&&(
                   <>
@@ -856,13 +986,14 @@ export default function Home() {
                 <div className="flex-1 flex items-center px-4 rounded-2xl t"
                   style={{background:T.inputBg,border:`1px solid ${T.border2}`,minHeight:'48px'}}>
                   <input ref={inputRef} value={newMsg} onChange={e=>setNewMsg(e.target.value)}
-                    placeholder={mediaPrev?'Add a caption…':'Message…'}
+                    placeholder={isOnline?(mediaPrev?'Add a caption…':'Message…'):'آفلاین — ارسال ممکن نیست'}
+                    disabled={!isOnline}
                     className="flex-1 bg-transparent text-sm py-3 t" style={{color:T.text,border:'none'}}/>
                 </div>
                 <button type="submit" disabled={sending||!isOnline} className="sb w-12 h-12 rounded-2xl flex items-center justify-center shrink-0"
-                  style={{background:(newMsg.trim()||mediaPrev)?'linear-gradient(135deg,#4f46e5,#7c3aed)':(dark?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.06)')}}>
+                  style={{background:(newMsg.trim()||mediaPrev)&&isOnline?'linear-gradient(135deg,#4f46e5,#7c3aed)':(dark?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.06)')}}>
                   {sending?<Loader2 size={18} className="animate-spin text-white"/>
-                    :<Send size={18} style={{color:(newMsg.trim()||mediaPrev)?'#fff':T.iconInactive}}/>}
+                    :<Send size={18} style={{color:(newMsg.trim()||mediaPrev)&&isOnline?'#fff':T.iconInactive}}/>}
                 </button>
               </form>
             )}
@@ -879,11 +1010,40 @@ export default function Home() {
                 <h1 className="text-2xl font-bold" style={{fontFamily:'Syne,sans-serif',color:T.text}}>
                   {activeTab==='chat'?'Messages':activeTab==='settings'?'Settings':'Profile'}
                 </h1>
-                {activeTab==='chat'&&<p className="text-xs mt-0.5" style={{color:T.textSub}}>{onlineCount} online</p>}
+                {activeTab==='chat'&&(
+                  <p className="text-xs mt-0.5" style={{color:T.textSub}}>
+                    {isOnline?`${onlineCount} online`:'آفلاین · از کش'}
+                  </p>
+                )}
               </div>
-              <ThemeToggle/>
+              <div className="flex items-center gap-2">
+                {isOnline && (
+                  <button onClick={manualSync} title="Sync"
+                    className="p-2 rounded-xl"
+                    style={{background:dark?'rgba(255,255,255,0.06)':'rgba(0,0,0,0.05)',color:T.textSub}}>
+                    <RefreshCw size={16}/>
+                  </button>
+                )}
+                <ThemeToggle/>
+              </div>
             </div>
           </div>
+
+          {/* آفلاین بنر در لیست */}
+          {!isOnline&&(
+            <div className="mx-4 mb-2 flex items-center justify-between gap-2 px-4 py-2.5 rounded-2xl"
+              style={{background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.2)"}}>
+              <div className="flex items-center gap-2">
+                <WifiOff size={14} style={{color:"#f87171"}}/>
+                <p className="text-xs font-medium" style={{color:"#f87171"}}>آفلاین — نمایش از کش محلی</p>
+              </div>
+              <button onClick={manualSync}
+                className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs"
+                style={{background:'rgba(239,68,68,0.15)',color:'#f87171'}}>
+                <RefreshCw size={10}/> Retry
+              </button>
+            </div>
+          )}
 
           <div className="flex-1 overflow-y-auto t" style={{background:T.bg}}>
 
@@ -928,13 +1088,23 @@ export default function Home() {
                         <h3 className="font-semibold text-sm truncate" style={{fontFamily:'Syne,sans-serif',color:T.text}}>
                           {u.full_name||u.username?.split('@')[0]}
                         </h3>
-                        <p className="text-xs" style={{color:isOn?T.onlineDot:T.textSub}}>{isOn?'● Online':'Offline'}</p>
+                        <p className="text-xs" style={{color:isOn?T.onlineDot:T.textSub}}>
+                          {isOnline?(isOn?'● Online':'Offline'):'Cached'}
+                        </p>
                       </div>
                       {cnt>0&&<div className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0"
                         style={{background:'#ef4444',color:'#fff'}}>{cnt}</div>}
                     </div>
                   );
                 })}
+                {users.length===0&&!isOnline&&(
+                  <div className="flex flex-col items-center py-12 gap-3 opacity-40">
+                    <WifiOff size={32} style={{color:T.textSub}}/>
+                    <p className="text-sm text-center" style={{color:T.textSub}}>
+                      اول باید آنلاین بشی تا کاربرا کش بشن
+                    </p>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1103,24 +1273,27 @@ export default function Home() {
                     <p className="text-xs mb-1" style={{color:T.textSub}}>Email</p>
                     <p className="text-sm font-medium" style={{color:T.text}}>{currentUser?.email}</p>
                   </div>
-                  {!isAdmin&&(
-                    <>
-                      <p className="text-xs font-semibold px-1 uppercase tracking-widest mt-2" style={{color:T.textSub}}>Network</p>
-                      <div className="flex items-center justify-between p-4 rounded-2xl t" style={card}>
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{background:isOnline?'rgba(129,140,248,0.1)':'rgba(239,68,68,0.1)'}}>
-                            {isOnline?<Wifi size={18} style={{color:'#818cf8'}}/>:<WifiOff size={18} style={{color:'#f87171'}}/>}
-                          </div>
-                          <div>
-                            <p className="text-sm font-medium" style={{color:T.text}}>Real Internet Check</p>
-                            <p className="text-xs" style={{color:isOnline?T.textSub:'#f87171'}}>{isOnline?'آنلاین':'آفلاین'} · {realInternetCheck?'چک سفارشی':'navigator.onLine'}</p>
-                          </div>
+                  <div>
+                    <p className="text-xs font-semibold px-1 uppercase tracking-widest mt-2 mb-3" style={{color:T.textSub}}>Network</p>
+                    <div className="flex items-center justify-between p-4 rounded-2xl t" style={card}>
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{background:isOnline?'rgba(129,140,248,0.1)':'rgba(239,68,68,0.1)'}}>
+                          {isOnline?<Wifi size={18} style={{color:'#818cf8'}}/>:<WifiOff size={18} style={{color:'#f87171'}}/>}
                         </div>
-                        <Toggle on={realInternetCheck} onToggle={toggleRealCheck}/>
+                        <div>
+                          <p className="text-sm font-medium" style={{color:T.text}}>Real Internet Check</p>
+                          <p className="text-xs" style={{color:isOnline?T.textSub:'#f87171'}}>
+                            {isOnline?'Online':'Offline'}
+                          </p>
+                        </div>
                       </div>
-                    </>
-                  )}
-                  <button onClick={()=>supabase.auth.signOut().then(()=>router.push('/login'))}
+                      <Toggle on={realInternetCheck} onToggle={toggleRealCheck}/>
+                    </div>
+                  </div>
+                  <button onClick={async()=>{
+                    await cache.clearSession().catch(()=>{});
+                    supabase.auth.signOut().then(()=>router.push('/login'));
+                  }}
                     className="w-full flex items-center justify-center gap-2 p-4 rounded-2xl mt-2 font-semibold text-sm t"
                     style={{background:T.signOutBg,border:`1px solid ${T.signOutBdr}`,color:T.signOutTxt}}>
                     <LogOut size={16}/> Sign Out
@@ -1157,8 +1330,6 @@ export default function Home() {
       )}
 
       {/* ═══════════════ MODALS ══════════════════════════════════════ */}
-
-      {/* Add Member */}
       {showAddMember&&(
         <div className="fixed inset-0 z-50 flex items-end justify-center" style={{background:'rgba(0,0,0,0.7)',backdropFilter:'blur(8px)'}}>
           <div className="w-full max-w-md p-6 pb-12 rounded-t-3xl t" style={{background:T.modalBg,border:`1px solid ${T.border}`}}>
@@ -1181,7 +1352,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* Group edit / new */}
       {editGrp!==null&&(
         <div className="fixed inset-0 z-50 flex flex-col t" style={{background:T.bg}}>
           <div className="flex items-center gap-3 px-4 shrink-0 t"
@@ -1238,7 +1408,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* User edit */}
       {editUsr&&(
         <div className="fixed inset-0 z-50 flex items-end justify-center" style={{background:'rgba(0,0,0,0.7)',backdropFilter:'blur(8px)'}}>
           <div className="w-full max-w-md p-6 pb-12 rounded-t-3xl t" style={{background:T.modalBg,border:`1px solid ${T.border}`}}>
