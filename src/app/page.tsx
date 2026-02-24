@@ -7,9 +7,9 @@ import {
   Send, User, LogOut, MessageSquare, Loader2, ShieldCheck, Users,
   Check, CheckCheck, ChevronLeft, Settings, UserCircle, Plus, Trash2,
   Camera, Edit3, X, ImageIcon, FileImage, Search, Crown, ArrowLeft,
-  Reply, CornerUpLeft, Pencil, WifiOff, Wifi, RefreshCw,
+  Reply, CornerUpLeft, Pencil, WifiOff, Wifi,
 } from 'lucide-react';
-import { useNetworkStatus } from '@/lib/useNetworkStatus';
+
 
 type Tab = 'chat' | 'settings' | 'profile';
 
@@ -51,7 +51,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export default function Home() {
   const router = useRouter();
   const [loading, setLoading]   = useState(true);
-  const [dark, setDark]         = useState(true);
+  const [dark, setDark] = useState<boolean>(()=>{
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('theme');
+    return saved === null ? true : saved === 'dark';
+  });
   const [currentUser, setCU]    = useState<any>(null);
   const [profile, setProfile]   = useState<any>(null);
   const [isAdmin, setIsAdmin]   = useState(false);
@@ -101,12 +105,12 @@ export default function Home() {
   const [newFullName, setNewFullName] = useState('');
 
   // ── Network ────────────────────────────────────────────────────────────────
+  const [isOnline, setIsOnline] = useState(true);
   const [realInternetCheck, setRealInternetCheck] = useState<boolean>(()=>{
     if (typeof window === 'undefined') return true;
     const saved = localStorage.getItem('realInternetCheck');
     return saved === null ? true : saved === 'true';
   });
-  const { isOnline, checkReal, checking } = useNetworkStatus(realInternetCheck);
 
   const toggleRealCheck = () => {
     const v = !realInternetCheck;
@@ -194,7 +198,7 @@ export default function Home() {
 
   // ── REALTIME: profiles ─────────────────────────────────────────────────────
   useEffect(()=>{
-    if (!currentUser || !isOnline) return;
+    if (!currentUser) return;
     const ch = supabase.channel('profiles-live')
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'profiles'},(payload)=>{
         const updated = payload.new as any;
@@ -208,11 +212,11 @@ export default function Home() {
       })
       .subscribe();
     return ()=>{ supabase.removeChannel(ch); };
-  },[currentUser, isOnline]);
+  },[currentUser]);
 
   // ── REALTIME: messages + presence ─────────────────────────────────────────
   useEffect(()=>{
-    if (!currentUser || !isOnline) return;
+    if (!currentUser) return;
     const ch = supabase.channel('chat-room',{config:{presence:{key:currentUser.id}}});
     ch
       .on('presence',{event:'sync'},()=>{
@@ -244,13 +248,19 @@ export default function Home() {
       .on('postgres_changes',{event:'DELETE',schema:'public',table:'messages'},(p)=>{
         setMessages(prev=>prev.filter(m=>m.id!==p.old.id));
       })
-      .subscribe(async(s)=>{ if(s==='SUBSCRIBED') await ch.track({online_at:new Date().toISOString()}); });
-    return ()=>{
-      supabase.removeChannel(ch);
-      // آفلاین شدیم — list آنلاین‌ها رو پاک کن
-      setOnlineIds(new Set());
-    };
-  },[currentUser, isOnline]);
+      .subscribe((status)=>{
+        if (status === 'SUBSCRIBED') {
+          // آنلاین — channel وصل شد
+          setIsOnline(true);
+          ch.track({online_at:new Date().toISOString()});
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          // آفلاین یا خطا
+          if (realInternetCheck) setIsOnline(false);
+          setOnlineIds(new Set());
+        }
+      });
+    return ()=>{ supabase.removeChannel(ch); };
+  },[currentUser, realInternetCheck]);
 
   useEffect(()=>{ scrollRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
 
@@ -487,7 +497,7 @@ export default function Home() {
   const card2 = {background:T.bgCard2, border:`1px solid ${T.border}`};
 
   const ThemeToggle=()=>(
-    <button onClick={()=>setDark(d=>!d)} title={dark?'Light mode':'Dark mode'}
+    <button onClick={()=>setDark(d=>{ const v=!d; localStorage.setItem('theme',v?'dark':'light'); return v; })} title={dark?'Light mode':'Dark mode'}
       style={{position:'relative',width:56,height:28,borderRadius:14,cursor:'pointer',
         background:dark?'#1e1e3a':'#dde3ff',
         border:dark?'1px solid rgba(99,102,241,0.4)':'1px solid rgba(79,70,229,0.25)',
@@ -662,13 +672,7 @@ export default function Home() {
                 <WifiOff size={14} style={{color:"#f87171",flexShrink:0}}/>
                 <p className="text-xs font-medium" style={{color:"#f87171"}}>آفلاین — ارسال پیام غیرفعال است</p>
               </div>
-              {realInternetCheck&&(
-                <button onClick={checkReal} disabled={checking}
-                  className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium"
-                  style={{background:"rgba(239,68,68,0.15)",color:"#f87171"}}>
-                  <RefreshCw size={11} className={checking?"animate-spin":""}/> چک
-                </button>
-              )}
+
             </div>
           )}
 
@@ -959,6 +963,22 @@ export default function Home() {
                 </div>
 
                 <div>
+                  <p className="text-xs font-semibold px-1 mb-3 uppercase tracking-widest" style={{color:T.textSub}}>Network</p>
+                  <div className="flex items-center justify-between p-4 rounded-2xl t" style={card}>
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{background:isOnline?'rgba(129,140,248,0.1)':'rgba(239,68,68,0.1)'}}>
+                        {isOnline?<Wifi size={18} style={{color:'#818cf8'}}/>:<WifiOff size={18} style={{color:'#f87171'}}/>}
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium" style={{color:T.text}}>Real Internet Check</p>
+                        <p className="text-xs" style={{color:isOnline?T.textSub:'#f87171'}}>{isOnline?'Online':'Offline'}</p>
+                      </div>
+                    </div>
+                    <Toggle on={realInternetCheck} onToggle={toggleRealCheck}/>
+                  </div>
+                </div>
+
+                <div>
                   <p className="text-xs font-semibold px-1 mb-3 uppercase tracking-widest" style={{color:T.textSub}}>Permissions</p>
                   <div className="flex items-center justify-between p-4 rounded-2xl t" style={card}>
                     <div className="flex items-center gap-3">
@@ -1083,22 +1103,23 @@ export default function Home() {
                     <p className="text-xs mb-1" style={{color:T.textSub}}>Email</p>
                     <p className="text-sm font-medium" style={{color:T.text}}>{currentUser?.email}</p>
                   </div>
-                  <p className="text-xs font-semibold px-1 uppercase tracking-widest mt-4 mb-2" style={{color:T.textSub}}>Network</p>
-                  <div className="flex items-center justify-between p-4 rounded-2xl t" style={card}>
-                    <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{background:realInternetCheck?"rgba(129,140,248,0.1)":"rgba(100,116,139,0.1)"}}>
-                        {isOnline?<Wifi size={18} style={{color:realInternetCheck?"#818cf8":"#64748b"}}/>:<WifiOff size={18} style={{color:"#f87171"}}/>}
+                  {!isAdmin&&(
+                    <>
+                      <p className="text-xs font-semibold px-1 uppercase tracking-widest mt-2" style={{color:T.textSub}}>Network</p>
+                      <div className="flex items-center justify-between p-4 rounded-2xl t" style={card}>
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{background:isOnline?'rgba(129,140,248,0.1)':'rgba(239,68,68,0.1)'}}>
+                            {isOnline?<Wifi size={18} style={{color:'#818cf8'}}/>:<WifiOff size={18} style={{color:'#f87171'}}/>}
+                          </div>
+                          <div>
+                            <p className="text-sm font-medium" style={{color:T.text}}>Real Internet Check</p>
+                            <p className="text-xs" style={{color:isOnline?T.textSub:'#f87171'}}>{isOnline?'آنلاین':'آفلاین'} · {realInternetCheck?'چک سفارشی':'navigator.onLine'}</p>
+                          </div>
+                        </div>
+                        <Toggle on={realInternetCheck} onToggle={toggleRealCheck}/>
                       </div>
-                      <div>
-                        <p className="text-sm font-medium" style={{color:T.text}}>Real Internet Check</p>
-                        <p className="text-xs" style={{color:T.textSub}}>{isOnline?"آنلاین":"آفلاین"} · {realInternetCheck?"چک سفارشی":"navigator.onLine"}</p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {realInternetCheck&&<button onClick={checkReal} disabled={checking} className="p-2 rounded-xl" style={{background:"rgba(129,140,248,0.1)",color:"#818cf8"}}><RefreshCw size={13} className={checking?"animate-spin":""}/></button>}
-                      <Toggle on={realInternetCheck} onToggle={toggleRealCheck}/>
-                    </div>
-                  </div>
+                    </>
+                  )}
                   <button onClick={()=>supabase.auth.signOut().then(()=>router.push('/login'))}
                     className="w-full flex items-center justify-center gap-2 p-4 rounded-2xl mt-2 font-semibold text-sm t"
                     style={{background:T.signOutBg,border:`1px solid ${T.signOutBdr}`,color:T.signOutTxt}}>
