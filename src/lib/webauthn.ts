@@ -12,12 +12,23 @@ function bufToB64(buf: ArrayBuffer): string {
   return btoa(String.fromCharCode(...new Uint8Array(buf)));
 }
 
-function b64ToBuf(b64: string): Uint8Array {
-  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+function b64ToBuf(b64: string): ArrayBuffer {
+  const arr = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  return arr.buffer.slice(0) as ArrayBuffer;
 }
 
-function randomBytes(n = 32): Uint8Array {
-  return crypto.getRandomValues(new Uint8Array(n));
+// crypto.getRandomValues یه Uint8Array<ArrayBufferLike> برمی‌گردونه
+// ولی WebAuthn API به صراحت ArrayBuffer (نه SharedArrayBuffer) می‌خواد
+// با slice(0) یه کپی با type خالص ArrayBuffer می‌سازیم
+function randomBytes(n = 32): ArrayBuffer {
+  const buf = new Uint8Array(n);
+  crypto.getRandomValues(buf);
+  return buf.buffer.slice(0) as ArrayBuffer;
+}
+
+// TextEncoder هم همین مشکل رو داره — برای user.id
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+  return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
 }
 
 // ── Feature detection ──────────────────────────────────────────────────────
@@ -41,7 +52,7 @@ export function hasSavedCredential(): boolean {
 export async function registerBiometric(userId: string, userEmail: string): Promise<boolean> {
   try {
     const challenge  = randomBytes(32);
-    const userIdBuf  = new TextEncoder().encode(userId);
+    const userIdBuf  = toArrayBuffer(new TextEncoder().encode(userId));
 
     const credential = await navigator.credentials.create({
       publicKey: {
