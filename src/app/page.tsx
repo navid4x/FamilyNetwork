@@ -3,7 +3,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { supabase, onWsDisconnect } from '@/lib/supabase';
 import { cache } from '@/lib/cache';
-import { prefetchAllMessages, prefetchAvatars } from '@/lib/prefetch';
 import { useRouter } from 'next/navigation';
 import {
   Send, User, LogOut, MessageSquare, Loader2, ShieldCheck, Users,
@@ -101,15 +100,10 @@ export default function Home() {
   const [editingName, setEditingName] = useState(false);
   const [newFullName, setNewFullName] = useState('');
 
-  // ── Network state — هم ref هم state تا closure مشکل نداشته باشیم ─────────
+  // ── Network: فقط بر اساس وضعیت WebSocket ─────────────────────────────────
   const [isOnline, setIsOnline] = useState(false);
-  // isOnlineRef برای استفاده داخل callback/closure‌ها — همیشه آپدیت‌شده
-  const isOnlineRef = useRef(false);
 
-  const setOnlineStatus = useCallback((val: boolean) => {
-    isOnlineRef.current = val;
-    setIsOnline(val);
-  }, []);
+
 
   const avatarRef  = useRef<HTMLInputElement>(null);
   const scrollRef  = useRef<HTMLDivElement>(null);
@@ -118,20 +112,13 @@ export default function Home() {
   const selUserRef = useRef<any>(null);
   const selGrpRef  = useRef<any>(null);
   const cuRef      = useRef<any>(null);
+  // ref برای نگه داشتن channel تا بتونیم reconnect کنیم
   const chatChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const retryTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
-  // unread ref برای ذخیره در cache بدون وابستگی به state در closure
-  const unreadRef = useRef<Record<string,number>>({});
 
   useEffect(()=>{ selUserRef.current = selUser; },[selUser]);
   useEffect(()=>{ selGrpRef.current  = selGroup; },[selGroup]);
   useEffect(()=>{ cuRef.current      = currentUser; },[currentUser]);
-
-  // وقتی unread تغییر کنه، هم ref و هم cache رو آپدیت کن
-  useEffect(()=>{
-    unreadRef.current = unread;
-    cache.saveUnread(unread).catch(()=>{});
-  },[unread]);
 
   const T = dark ? DARK : LIGHT;
   const fmt  = (d:string) => new Date(d).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false});
@@ -142,17 +129,14 @@ export default function Home() {
       : dt.toLocaleDateString('en-US',{month:'short',day:'numeric'});
   };
 
-  // refreshUnread از isOnlineRef استفاده می‌کنه نه isOnline state
-  const refreshUnread = useCallback(async (uid:string) => {
-    if (!isOnlineRef.current) return;
-    try {
-      const { data } = await supabase.from('messages').select('sender_id')
-        .eq('receiver_id',uid).eq('is_read',false);
-      const m:Record<string,number> = {};
-      data?.forEach((r:any)=>{ m[r.sender_id]=(m[r.sender_id]||0)+1; });
-      setUnread(m);
-    } catch {}
-  }, []);
+  const refreshUnread = async (uid:string) => {
+    if (!isOnline) return;
+    const { data } = await supabase.from('messages').select('sender_id')
+      .eq('receiver_id',uid).eq('is_read',false);
+    const m:Record<string,number> = {};
+    data?.forEach((r:any)=>{ m[r.sender_id]=(m[r.sender_id]||0)+1; });
+    setUnread(m);
+  };
 
   // Close context menu on outside click
   useEffect(()=>{
@@ -163,7 +147,7 @@ export default function Home() {
     }
   },[ctxMenu]);
 
-  // ── INIT ──────────────────────────────────────────────────────────────────
+  // ── INIT: ابتدا از کش بخون، بعد از سرور ──────────────────────────────────
   useEffect(()=>{
     const init = async () => {
       const { data:{session} } = await supabase.auth.getSession();
@@ -172,10 +156,7 @@ export default function Home() {
         const cachedSession = await cache.getSession().catch(()=>null);
         if (cachedSession) {
           await loadFromCache(cachedSession.userId, cachedSession.userData);
-          // unread رو از کش بخون
-          const cachedUnread = await cache.getUnread().catch(()=>({}));
-          setUnread(cachedUnread);
-          setOnlineStatus(false);
+          setIsOnline(false);
           setLoading(false);
           return;
         }
@@ -187,18 +168,13 @@ export default function Home() {
       setCU(user); cuRef.current = user;
       await cache.saveSession(user.id, user).catch(()=>{});
 
-      // ابتدا از کش بخون (سریع)
       await loadFromCache(user.id, user);
-      // unread رو از کش بخون
-      const cachedUnread = await cache.getUnread().catch(()=>({}));
-      setUnread(cachedUnread);
       setLoading(false);
 
-      // sync از سرور (WebSocket وضعیت آنلاین رو ست می‌کنه)
+      // sync اولیه — WebSocket channel وضعیت آنلاین رو ست می‌کنه
       await syncFromServer().catch(()=>{});
     };
     init();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[router]);
 
   // ── Load از IndexedDB ─────────────────────────────────────────────────────
@@ -241,13 +217,12 @@ export default function Home() {
     }
   };
 
-  // ── Sync از Supabase ──────────────────────────────────────────────────────
+  // ── Sync از Supabase و ذخیره در کش ───────────────────────────────────────
   const syncFromServer = async () => {
     const cu = cuRef.current;
     if (!cu) return;
+    // اگه آفلاینیم اصلاً تلاش نکن
     if (disconnectedRef.current) return;
-    // آیا اولین sync هست؟ (برای تشخیص نیاز به prefetch)
-    const isFirstSync = !(await cache.getMeta('prefetched_at').catch(()=>null));
     try {
       const [{ data: profData }, { data: grpData }] = await Promise.all([
         supabase.from('profiles').select('*'),
@@ -276,19 +251,6 @@ export default function Home() {
             adminIdRef.current = adminProf.id;
             setAllowFiles(adminProf.settings_allow_files || false);
           }
-        }
-
-        // ── Prefetch پس‌زمینه: اولین بار یا هر بار که آنلاین میشیم ──
-        // در پس‌زمینه اجرا می‌کنیم تا UI رو block نکنه
-        const otherIds = others.map((p:any) => p.id);
-        const grpIds = (grpData || []).map((g:any) => String(g.id));
-        if (isFirstSync || true) {
-          // همیشه prefetch می‌کنیم تا پیام‌های جدید هم کش بشن
-          prefetchAllMessages(cu.id, otherIds, grpIds)
-            .then(() => cache.setMeta('prefetched_at', Date.now()))
-            .catch(() => {});
-          // عکس‌های پروفایل رو هم prefetch کن
-          prefetchAvatars(profData).catch(() => {});
         }
       }
 
@@ -332,6 +294,7 @@ export default function Home() {
     if (connectingRef.current) return;
     connectingRef.current = true;
 
+    // channel قبلی رو پاک کن
     if (chatChannelRef.current) {
       try { chatChannelRef.current.untrack(); } catch {}
       supabase.removeChannel(chatChannelRef.current);
@@ -379,7 +342,7 @@ export default function Home() {
         if (status === 'SUBSCRIBED') {
           const wasOffline = disconnectedRef.current;
           disconnectedRef.current = false;
-          setOnlineStatus(true);
+          setIsOnline(true);
           ch.track({ online_at: new Date().toISOString() });
           if (retryTimerRef.current) {
             clearInterval(retryTimerRef.current);
@@ -390,22 +353,27 @@ export default function Home() {
             syncFromServer().catch(()=>{});
           }
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          goOffline(status);
+          const reason = status === 'CHANNEL_ERROR' ? 'channel error'
+                       : status === 'TIMED_OUT'     ? 'timed out'
+                       :                              'closed';
+          goOffline(reason);
         }
       });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // وقتی آفلاین میشیم — فقط یه بار
   const goOffline = useCallback((reason?: string) => {
     if (disconnectedRef.current) return;
     disconnectedRef.current = true;
     connectingRef.current = false;
-    setOnlineStatus(false);
+    setIsOnline(false);
     setOnlineIds(new Set());
-    console.log('[WS] disconnected:', reason);
+    console.log('[WS] disconnected');
     if (!retryTimerRef.current) {
       retryTimerRef.current = setInterval(() => {
-        console.log('[WS] retrying...');
+        if (reason) console.log(`[WS] retry in 10s... (last failure: ${reason})`);
+        else        console.log('[WS] retry in 10s...');
         connectingRef.current = false;
         setupChatChannel();
       }, 10000);
@@ -416,6 +384,7 @@ export default function Home() {
   useEffect(()=>{
     if (!currentUser) return;
     setupChatChannel();
+    // ── بلافاصله از قطع شدن WebSocket خبردار میشیم ──
     const unsub = onWsDisconnect(() => goOffline('connection lost'));
     return ()=>{
       unsub();
@@ -432,8 +401,7 @@ export default function Home() {
 
   useEffect(()=>{ scrollRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
 
-  // ── Fetch messages ────────────────────────────────────────────────────────
-  // مهم: isOnline رو از ref می‌خونیم نه state تا stale closure نداشته باشیم
+  // ── Fetch messages: اول کش، بعد سرور ─────────────────────────────────────
   const selUserId  = selUser?.id  ?? null;
   const selGrpId   = selGroup?.id ?? null;
 
@@ -441,7 +409,6 @@ export default function Home() {
     const cu = cuRef.current;
     if (!cu||(!selUserId&&!selGrpId)){ setMessages([]); return; }
 
-    // اول از کش بخون (سریع — حتی آفلاین)
     try {
       const cached = selGrpId
         ? await cache.getGroupMessages(String(selGrpId))
@@ -449,8 +416,7 @@ export default function Home() {
       if (cached.length > 0) setMessages(cached);
     } catch {}
 
-    // اگه آفلاینیم اینجا متوقف می‌شیم
-    if (!isOnlineRef.current) return;
+    if (!isOnline) return;
 
     let q = supabase.from('messages').select('*');
     if (selGrpId) q=q.eq('group_id',selGrpId);
@@ -465,10 +431,7 @@ export default function Home() {
         .eq('sender_id',selUserId).eq('receiver_id',cu.id).eq('is_read',false);
       setUnread(prev=>({...prev,[selUserId]:0}));
     }
-  // fetchMessages فقط به selUserId و selGrpId وابسته‌ست، نه isOnline
-  // چون از isOnlineRef استفاده می‌کنه
-  },[selUserId, selGrpId]);
-
+  },[selUserId,selGrpId,isOnline]);
   useEffect(()=>{ fetchMessages(); },[fetchMessages]);
 
   // ── Send message ───────────────────────────────────────────────────────────
@@ -500,12 +463,14 @@ export default function Home() {
     setSending(false);
   };
 
+  // ── Delete message ─────────────────────────────────────────────────────────
   const deleteMsg = async(msg:any)=>{
     if(!currentUser||msg.sender_id!==currentUser.id) return;
     await cache.deleteMessage(msg.id).catch(()=>{});
     await supabase.from('messages').delete().eq('id',msg.id);
   };
 
+  // ── Edit message ───────────────────────────────────────────────────────────
   const startEdit = (msg:any)=>{
     setEditingMsg(msg);
     setEditContent(msg.content||'');
@@ -530,6 +495,7 @@ export default function Home() {
 
   const cancelEdit = ()=>{ setEditingMsg(null); setEditContent(''); };
 
+  // ── Context menu ───────────────────────────────────────────────────────────
   const openCtxMenu=(e:React.MouseEvent,msg:any)=>{
     e.preventDefault();
     e.stopPropagation();
@@ -651,8 +617,9 @@ export default function Home() {
     else alert(error.message);
   };
 
+  // ── Manual refresh ────────────────────────────────────────────────────────
   const manualSync = async () => {
-    if (!isOnlineRef.current) {
+    if (!isOnline) {
       setupChatChannel();
       return;
     }
@@ -660,6 +627,7 @@ export default function Home() {
     await fetchMessages();
   };
 
+  // ── Message search ─────────────────────────────────────────────────────────
   const filteredMsgs = msgSearch.trim()
     ? messages.filter(m=>!m.is_image && (m.content||'').toLowerCase().includes(msgSearch.toLowerCase()))
     : messages;
@@ -705,9 +673,8 @@ export default function Home() {
   const ThemeToggle=()=>(
     <div className="flex items-center gap-2">
       <div title={isOnline ? 'Online' : 'Offline — retrying…'}
-        onClick={manualSync}
         style={{
-          width: 32, height: 32, borderRadius: 10, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, cursor:'pointer',
+          width: 32, height: 32, borderRadius: 10, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0,
           background: isOnline ? (dark?'rgba(74,222,128,0.12)':'rgba(34,197,94,0.1)') : (dark?'rgba(239,68,68,0.12)':'rgba(239,68,68,0.08)'),
         }}>
         {isOnline
@@ -778,8 +745,7 @@ export default function Home() {
     );
   };
 
-  // card2 is used in group editor
-  void card2;
+
 
   return (
     <div className="flex flex-col h-screen overflow-hidden"
@@ -1057,41 +1023,18 @@ export default function Home() {
       {/* ═══════════════ TABBED VIEW ═════════════════════════════════ */}
       {!inChat&&(
         <div className="flex flex-col h-full">
-          <div className="px-5 pb-4 shrink-0 t" style={{ background: T.bg, paddingTop: "calc(var(--spacing) * 8)" }}>
-              <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1">
-  
-              {/* Left: Icon */}
-              <img 
-                src="/icon-192.png" 
-                alt="FamilyChat" 
-                className="object-cover"
-                style={{ width: 40, height: 40 }}
-              />            
-
-              {/* Right: Title + status */}
-              <div className="flex flex-col">
-
-                <h1 
-                  className="text-2xl font-bold leading-none"
-                  style={{ fontFamily: 'Syne, sans-serif', color: T.text }}
-                >
-                  {activeTab === 'chat'
-                    ? 'Messages'
-                    : activeTab === 'settings'
-                    ? 'Settings'
-                    : 'Profile'}
-                </h1>           
-
-                {activeTab === 'chat' && (
-                  <p className="text-xs mt-0.5" style={{ color: T.textSub }}>
-                    {isOnline ? `${onlineCount} online` : 'Offline · cached'}
+          <div className="px-5 pt-12 pb-4 shrink-0 t" style={{background:T.bg}}>
+            <div className="flex items-center justify-between">
+              <div>
+                <h1 className="text-2xl font-bold" style={{fontFamily:'Syne,sans-serif',color:T.text}}>
+                  {activeTab==='chat'?'Messages':activeTab==='settings'?'Settings':'Profile'}
+                </h1>
+                {activeTab==='chat'&&(
+                  <p className="text-xs mt-0.5" style={{color:T.textSub}}>
+                    {isOnline?`${onlineCount} online`:'Offline · cached'}
                   </p>
-                )}            
-
-              </div>            
-
-            </div>
+                )}
+              </div>
               <div className="flex items-center gap-2">
                 <ThemeToggle/>
               </div>
