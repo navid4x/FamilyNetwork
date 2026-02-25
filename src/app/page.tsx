@@ -1,14 +1,14 @@
 'use client';
 
 import { useEffect, useState, useRef, useCallback } from 'react';
-import { supabase } from '@/lib/supabase';
+import { supabase, onWsDisconnect } from '@/lib/supabase';
 import { cache } from '@/lib/cache';
 import { useRouter } from 'next/navigation';
 import {
   Send, User, LogOut, MessageSquare, Loader2, ShieldCheck, Users,
   Check, CheckCheck, ChevronLeft, Settings, UserCircle, Plus, Trash2,
   Camera, Edit3, X, ImageIcon, FileImage, Search, Crown, ArrowLeft,
-  Reply, CornerUpLeft, Pencil, WifiOff, Wifi, RefreshCw,
+  Reply, CornerUpLeft, Pencil, WifiOff, Wifi,
 } from 'lucide-react';
 
 
@@ -100,22 +100,10 @@ export default function Home() {
   const [editingName, setEditingName] = useState(false);
   const [newFullName, setNewFullName] = useState('');
 
-  // ── Network ────────────────────────────────────────────────────────────────
-  const [isOnline, setIsOnline] = useState(true);
-  const [realInternetCheck, setRealInternetCheck] = useState<boolean>(()=>{
-    if (typeof window === 'undefined') return true;
-    const saved = localStorage.getItem('realInternetCheck');
-    return saved === null ? true : saved === 'true';
-  });
+  // ── Network: فقط بر اساس وضعیت WebSocket ─────────────────────────────────
+  const [isOnline, setIsOnline] = useState(false);
 
-  // وقتی آفلاین بودیم و آنلاین شدیم sync کنیم
-  const [needsSync, setNeedsSync] = useState(false);
 
-  const toggleRealCheck = () => {
-    const v = !realInternetCheck;
-    setRealInternetCheck(v);
-    localStorage.setItem('realInternetCheck', String(v));
-  };
 
   const avatarRef  = useRef<HTMLInputElement>(null);
   const scrollRef  = useRef<HTMLDivElement>(null);
@@ -124,6 +112,9 @@ export default function Home() {
   const selUserRef = useRef<any>(null);
   const selGrpRef  = useRef<any>(null);
   const cuRef      = useRef<any>(null);
+  // ref برای نگه داشتن channel تا بتونیم reconnect کنیم
+  const chatChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const retryTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(()=>{ selUserRef.current = selUser; },[selUser]);
   useEffect(()=>{ selGrpRef.current  = selGroup; },[selGroup]);
@@ -156,38 +147,14 @@ export default function Home() {
     }
   },[ctxMenu]);
 
-  // ── browser online/offline events ────────────────────────────────────────
-  useEffect(()=>{
-    const goOnline  = () => { setIsOnline(true);  setNeedsSync(true); };
-    const goOffline = () => { setIsOnline(false); setOnlineIds(new Set()); };
-    window.addEventListener('online',  goOnline);
-    window.addEventListener('offline', goOffline);
-    // وضعیت اولیه
-    setIsOnline(navigator.onLine);
-    return ()=>{
-      window.removeEventListener('online',  goOnline);
-      window.removeEventListener('offline', goOffline);
-    };
-  },[]);
-
-  // ── sync وقتی اینترنت برگشت ────────────────────────────────────────────
-  useEffect(()=>{
-    if (!needsSync || !currentUser || !isOnline) return;
-    setNeedsSync(false);
-    syncFromServer();
-  },[needsSync, currentUser, isOnline]);
-
   // ── INIT: ابتدا از کش بخون، بعد از سرور ──────────────────────────────────
   useEffect(()=>{
     const init = async () => {
-      // ── 1. بررسی session در Supabase (یا از IndexedDB) ──────────────────
       const { data:{session} } = await supabase.auth.getSession();
 
       if (!session) {
-        // آفلاینیم؟ کش session رو چک کن
         const cachedSession = await cache.getSession().catch(()=>null);
         if (cachedSession) {
-          // فقط از کش لود کن
           await loadFromCache(cachedSession.userId, cachedSession.userData);
           setIsOnline(false);
           setLoading(false);
@@ -199,17 +166,13 @@ export default function Home() {
 
       const user = session.user;
       setCU(user); cuRef.current = user;
-      // session رو ذخیره کن
       await cache.saveSession(user.id, user).catch(()=>{});
 
-      // ── 2. اول از کش بخون تا UI سریع نشون داده بشه ──────────────────────
       await loadFromCache(user.id, user);
       setLoading(false);
 
-      // ── 3. در پس‌زمینه از سرور sync کن ──────────────────────────────────
-      if (navigator.onLine) {
-        await syncFromServer();
-      }
+      // sync اولیه — WebSocket channel وضعیت آنلاین رو ست می‌کنه
+      await syncFromServer().catch(()=>{});
     };
     init();
   },[router]);
@@ -235,7 +198,6 @@ export default function Home() {
         const ids = new Set<string>(cachedProfiles.map((p:any) => p.id));
         knownUserIdsRef.current = ids;
 
-        // پیدا کردن admin برای allowFiles
         if (!(myProf?.is_admin)) {
           const adminProf = others.find((p:any) => p.is_admin);
           if (adminProf) {
@@ -259,6 +221,8 @@ export default function Home() {
   const syncFromServer = async () => {
     const cu = cuRef.current;
     if (!cu) return;
+    // اگه آفلاینیم اصلاً تلاش نکن
+    if (disconnectedRef.current) return;
     try {
       const [{ data: profData }, { data: grpData }] = await Promise.all([
         supabase.from('profiles').select('*'),
@@ -307,7 +271,6 @@ export default function Home() {
     const ch = supabase.channel('profiles-live')
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'profiles'},async(payload)=>{
         const updated = payload.new as any;
-        // کش رو آپدیت کن
         await cache.updateProfile(updated).catch(()=>{});
         if (updated.id === adminIdRef.current) {
           setAllowFiles(updated.settings_allow_files||false);
@@ -322,32 +285,46 @@ export default function Home() {
   },[currentUser]);
 
   // ── REALTIME: messages + presence ─────────────────────────────────────────
-  useEffect(()=>{
-    if (!currentUser) return;
-    const ch = supabase.channel('chat-room',{config:{presence:{key:currentUser.id}}});
+  const connectingRef   = useRef(false);
+  const disconnectedRef = useRef(false);
+
+  const setupChatChannel = useCallback(() => {
+    const cu = cuRef.current;
+    if (!cu) return;
+    if (connectingRef.current) return;
+    connectingRef.current = true;
+
+    // channel قبلی رو پاک کن
+    if (chatChannelRef.current) {
+      try { chatChannelRef.current.untrack(); } catch {}
+      supabase.removeChannel(chatChannelRef.current);
+      chatChannelRef.current = null;
+    }
+
+    const ch = supabase.channel('chat-room', { config: { presence: { key: cu.id } } });
+    chatChannelRef.current = ch;
+
     ch
       .on('presence',{event:'sync'},()=>{
         const keys = Object.keys(ch.presenceState());
         const known = knownUserIdsRef.current;
-        const realOnline = keys.filter(k => UUID_RE.test(k) && known.has(k) && k!==currentUser.id);
-        setOnlineIds(new Set(realOnline));
+        setOnlineIds(new Set(keys.filter(k => UUID_RE.test(k) && known.has(k) && k!==cu.id)));
       })
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'messages'},async(p)=>{
         const msg = p.new as any;
-        const cu  = cuRef.current;
+        const cu2 = cuRef.current;
         const su  = selUserRef.current;
         const sg  = selGrpRef.current;
-        if (!cu) return;
-        // ذخیره در کش
+        if (!cu2) return;
         await cache.upsertMessage(msg).catch(()=>{});
         const inView = sg
           ? String(msg.group_id)===String(sg.id)
-          : su && (msg.sender_id===su.id||msg.sender_id===cu.id);
+          : su && (msg.sender_id===su.id||msg.sender_id===cu2.id);
         if (inView){
           setMessages(prev=>prev.find(m=>m.id===msg.id)?prev:[...prev,msg]);
-          if (msg.receiver_id===cu.id)
+          if (msg.receiver_id===cu2.id)
             await supabase.from('messages').update({is_read:true}).eq('id',msg.id);
-        } else if (msg.receiver_id===cu.id){
+        } else if (msg.receiver_id===cu2.id){
           setUnread(prev=>({...prev,[msg.sender_id]:(prev[msg.sender_id]||0)+1}));
         }
       })
@@ -360,16 +337,67 @@ export default function Home() {
         setMessages(prev=>prev.filter(m=>m.id!==p.old.id));
       })
       .subscribe((status)=>{
+        connectingRef.current = false;
+
         if (status === 'SUBSCRIBED') {
+          const wasOffline = disconnectedRef.current;
+          disconnectedRef.current = false;
           setIsOnline(true);
-          ch.track({online_at:new Date().toISOString()});
+          ch.track({ online_at: new Date().toISOString() });
+          if (retryTimerRef.current) {
+            clearInterval(retryTimerRef.current);
+            retryTimerRef.current = null;
+          }
+          console.log('[WS] connected');
+          if (wasOffline) {
+            syncFromServer().catch(()=>{});
+          }
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          if (realInternetCheck) setIsOnline(false);
-          setOnlineIds(new Set());
+          const reason = status === 'CHANNEL_ERROR' ? 'channel error'
+                       : status === 'TIMED_OUT'     ? 'timed out'
+                       :                              'closed';
+          goOffline(reason);
         }
       });
-    return ()=>{ supabase.removeChannel(ch); };
-  },[currentUser, realInternetCheck]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // وقتی آفلاین میشیم — فقط یه بار
+  const goOffline = useCallback((reason?: string) => {
+    if (disconnectedRef.current) return;
+    disconnectedRef.current = true;
+    connectingRef.current = false;
+    setIsOnline(false);
+    setOnlineIds(new Set());
+    console.log('[WS] disconnected');
+    if (!retryTimerRef.current) {
+      retryTimerRef.current = setInterval(() => {
+        if (reason) console.log(`[WS] retry in 10s... (last failure: ${reason})`);
+        else        console.log('[WS] retry in 10s...');
+        connectingRef.current = false;
+        setupChatChannel();
+      }, 10000);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(()=>{
+    if (!currentUser) return;
+    setupChatChannel();
+    // ── بلافاصله از قطع شدن WebSocket خبردار میشیم ──
+    const unsub = onWsDisconnect(() => goOffline('connection lost'));
+    return ()=>{
+      unsub();
+      connectingRef.current = false;
+      disconnectedRef.current = false;
+      if (retryTimerRef.current) { clearInterval(retryTimerRef.current); retryTimerRef.current = null; }
+      if (chatChannelRef.current) {
+        try { chatChannelRef.current.untrack(); } catch {}
+        supabase.removeChannel(chatChannelRef.current);
+        chatChannelRef.current = null;
+      }
+    };
+  },[currentUser, setupChatChannel, goOffline]);
 
   useEffect(()=>{ scrollRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
 
@@ -381,7 +409,6 @@ export default function Home() {
     const cu = cuRef.current;
     if (!cu||(!selUserId&&!selGrpId)){ setMessages([]); return; }
 
-    // ── ابتدا از کش بخون (فوری) ─────────────────────────────────────────
     try {
       const cached = selGrpId
         ? await cache.getGroupMessages(String(selGrpId))
@@ -389,8 +416,7 @@ export default function Home() {
       if (cached.length > 0) setMessages(cached);
     } catch {}
 
-    // ── بعد از سرور sync کن (اگر آنلاین) ──────────────────────────────
-    if (!navigator.onLine) return;
+    if (!isOnline) return;
 
     let q = supabase.from('messages').select('*');
     if (selGrpId) q=q.eq('group_id',selGrpId);
@@ -398,7 +424,6 @@ export default function Home() {
     const { data,error } = await q.order('created_at',{ascending:true});
     if (!error && data) {
       setMessages(data);
-      // ذخیره همه پیام‌ها در کش
       await cache.saveMessages(data).catch(()=>{});
     }
     if (selUserId){
@@ -406,7 +431,7 @@ export default function Home() {
         .eq('sender_id',selUserId).eq('receiver_id',cu.id).eq('is_read',false);
       setUnread(prev=>({...prev,[selUserId]:0}));
     }
-  },[selUserId,selGrpId]);
+  },[selUserId,selGrpId,isOnline]);
   useEffect(()=>{ fetchMessages(); },[fetchMessages]);
 
   // ── Send message ───────────────────────────────────────────────────────────
@@ -528,7 +553,6 @@ export default function Home() {
     if(toAdd.length) await supabase.from('group_members').insert(toAdd.map(uid=>({group_id:editGrp.id,user_id:uid})));
     if(toDel.length) await supabase.from('group_members').delete().eq('group_id',editGrp.id).in('user_id',toDel);
     setEditGrp(null);
-    // sync groups cache
     const {data:grpData} = await supabase.from('groups').select('*');
     if(grpData) { await cache.saveGroups(grpData); setGroups(grpData); }
   };
@@ -593,9 +617,12 @@ export default function Home() {
     else alert(error.message);
   };
 
-  // ── Manual refresh (pull to refresh feel) ────────────────────────────────
+  // ── Manual refresh ────────────────────────────────────────────────────────
   const manualSync = async () => {
-    if (!isOnline) return;
+    if (!isOnline) {
+      setupChatChannel();
+      return;
+    }
     await syncFromServer();
     await fetchMessages();
   };
@@ -646,6 +673,17 @@ export default function Home() {
   const card2 = {background:T.bgCard2, border:`1px solid ${T.border}`};
 
   const ThemeToggle=()=>(
+    <div className="flex items-center gap-2">
+      <div title={isOnline ? 'Online' : 'Offline — retrying…'}
+        style={{
+          width: 32, height: 32, borderRadius: 10, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0,
+          background: isOnline ? (dark?'rgba(74,222,128,0.12)':'rgba(34,197,94,0.1)') : (dark?'rgba(239,68,68,0.12)':'rgba(239,68,68,0.08)'),
+        }}>
+        {isOnline
+          ? <Wifi size={16} style={{color: dark?'#4ade80':'#22c55e'}}/>
+          : <WifiOff size={16} style={{color:'#f87171'}}/>
+        }
+      </div>
     <button onClick={()=>setDark(d=>{ const v=!d; localStorage.setItem('theme',v?'dark':'light'); return v; })} title={dark?'Light mode':'Dark mode'}
       style={{position:'relative',width:56,height:28,borderRadius:14,cursor:'pointer',
         background:dark?'#1e1e3a':'#dde3ff',
@@ -662,6 +700,7 @@ export default function Home() {
         {dark?'🌙':'☀️'}
       </div>
     </button>
+    </div>
   );
 
   const Toggle=({on,onToggle,color='#4f46e5'}:{on:boolean,onToggle:()=>void,color?:string})=>(
@@ -708,23 +747,7 @@ export default function Home() {
     );
   };
 
-  // ── بنر آفلاین با دکمه Retry ──────────────────────────────────────────────
-  const OfflineBanner = () => (
-    <div className="flex items-center justify-between gap-2 px-4 py-2 shrink-0"
-      style={{background:"rgba(239,68,68,0.12)",borderBottom:"1px solid rgba(239,68,68,0.2)"}}>
-      <div className="flex items-center gap-2">
-        <WifiOff size={14} style={{color:"#f87171",flexShrink:0}}/>
-        <p className="text-xs font-medium" style={{color:"#f87171"}}>
-          آفلاین — نمایش از کش محلی
-        </p>
-      </div>
-      <button onClick={manualSync}
-        className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs"
-        style={{background:'rgba(239,68,68,0.15)',color:'#f87171'}}>
-        <RefreshCw size={11}/> Retry
-      </button>
-    </div>
-  );
+
 
   return (
     <div className="flex flex-col h-screen overflow-hidden"
@@ -821,8 +844,6 @@ export default function Home() {
               </div>
             </div>
           )}
-
-          {!isOnline && <OfflineBanner/>}
 
           {/* Messages */}
           <div className="flex-1 overflow-y-auto px-4 py-4 t" style={{background:T.bg}}
@@ -986,7 +1007,7 @@ export default function Home() {
                 <div className="flex-1 flex items-center px-4 rounded-2xl t"
                   style={{background:T.inputBg,border:`1px solid ${T.border2}`,minHeight:'48px'}}>
                   <input ref={inputRef} value={newMsg} onChange={e=>setNewMsg(e.target.value)}
-                    placeholder={isOnline?(mediaPrev?'Add a caption…':'Message…'):'آفلاین — ارسال ممکن نیست'}
+                    placeholder={isOnline?(mediaPrev?'Add a caption…':'Message…'):'Offline — cannot send'}
                     disabled={!isOnline}
                     className="flex-1 bg-transparent text-sm py-3 t" style={{color:T.text,border:'none'}}/>
                 </div>
@@ -1012,38 +1033,15 @@ export default function Home() {
                 </h1>
                 {activeTab==='chat'&&(
                   <p className="text-xs mt-0.5" style={{color:T.textSub}}>
-                    {isOnline?`${onlineCount} online`:'آفلاین · از کش'}
+                    {isOnline?`${onlineCount} online`:'Offline · cached'}
                   </p>
                 )}
               </div>
               <div className="flex items-center gap-2">
-                {isOnline && (
-                  <button onClick={manualSync} title="Sync"
-                    className="p-2 rounded-xl"
-                    style={{background:dark?'rgba(255,255,255,0.06)':'rgba(0,0,0,0.05)',color:T.textSub}}>
-                    <RefreshCw size={16}/>
-                  </button>
-                )}
                 <ThemeToggle/>
               </div>
             </div>
           </div>
-
-          {/* آفلاین بنر در لیست */}
-          {!isOnline&&(
-            <div className="mx-4 mb-2 flex items-center justify-between gap-2 px-4 py-2.5 rounded-2xl"
-              style={{background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.2)"}}>
-              <div className="flex items-center gap-2">
-                <WifiOff size={14} style={{color:"#f87171"}}/>
-                <p className="text-xs font-medium" style={{color:"#f87171"}}>آفلاین — نمایش از کش محلی</p>
-              </div>
-              <button onClick={manualSync}
-                className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs"
-                style={{background:'rgba(239,68,68,0.15)',color:'#f87171'}}>
-                <RefreshCw size={10}/> Retry
-              </button>
-            </div>
-          )}
 
           <div className="flex-1 overflow-y-auto t" style={{background:T.bg}}>
 
@@ -1089,7 +1087,7 @@ export default function Home() {
                           {u.full_name||u.username?.split('@')[0]}
                         </h3>
                         <p className="text-xs" style={{color:isOn?T.onlineDot:T.textSub}}>
-                          {isOnline?(isOn?'● Online':'Offline'):'Cached'}
+                          {isOn?'● Online':'Offline'}
                         </p>
                       </div>
                       {cnt>0&&<div className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0"
@@ -1101,7 +1099,7 @@ export default function Home() {
                   <div className="flex flex-col items-center py-12 gap-3 opacity-40">
                     <WifiOff size={32} style={{color:T.textSub}}/>
                     <p className="text-sm text-center" style={{color:T.textSub}}>
-                      اول باید آنلاین بشی تا کاربرا کش بشن
+                      Go online first to cache your contacts
                     </p>
                   </div>
                 )}
@@ -1129,22 +1127,6 @@ export default function Home() {
                       </div>
                       <span className="text-sm font-semibold" style={{fontFamily:'Syne,sans-serif',color:T.textSub}}>New Group</span>
                     </button>
-                  </div>
-                </div>
-
-                <div>
-                  <p className="text-xs font-semibold px-1 mb-3 uppercase tracking-widest" style={{color:T.textSub}}>Network</p>
-                  <div className="flex items-center justify-between p-4 rounded-2xl t" style={card}>
-                    <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{background:isOnline?'rgba(129,140,248,0.1)':'rgba(239,68,68,0.1)'}}>
-                        {isOnline?<Wifi size={18} style={{color:'#818cf8'}}/>:<WifiOff size={18} style={{color:'#f87171'}}/>}
-                      </div>
-                      <div>
-                        <p className="text-sm font-medium" style={{color:T.text}}>Real Internet Check</p>
-                        <p className="text-xs" style={{color:isOnline?T.textSub:'#f87171'}}>{isOnline?'Online':'Offline'}</p>
-                      </div>
-                    </div>
-                    <Toggle on={realInternetCheck} onToggle={toggleRealCheck}/>
                   </div>
                 </div>
 
@@ -1273,23 +1255,7 @@ export default function Home() {
                     <p className="text-xs mb-1" style={{color:T.textSub}}>Email</p>
                     <p className="text-sm font-medium" style={{color:T.text}}>{currentUser?.email}</p>
                   </div>
-                  <div>
-                    <p className="text-xs font-semibold px-1 uppercase tracking-widest mt-2 mb-3" style={{color:T.textSub}}>Network</p>
-                    <div className="flex items-center justify-between p-4 rounded-2xl t" style={card}>
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{background:isOnline?'rgba(129,140,248,0.1)':'rgba(239,68,68,0.1)'}}>
-                          {isOnline?<Wifi size={18} style={{color:'#818cf8'}}/>:<WifiOff size={18} style={{color:'#f87171'}}/>}
-                        </div>
-                        <div>
-                          <p className="text-sm font-medium" style={{color:T.text}}>Real Internet Check</p>
-                          <p className="text-xs" style={{color:isOnline?T.textSub:'#f87171'}}>
-                            {isOnline?'Online':'Offline'}
-                          </p>
-                        </div>
-                      </div>
-                      <Toggle on={realInternetCheck} onToggle={toggleRealCheck}/>
-                    </div>
-                  </div>
+
                   <button onClick={async()=>{
                     await cache.clearSession().catch(()=>{});
                     supabase.auth.signOut().then(()=>router.push('/login'));
