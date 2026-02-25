@@ -656,17 +656,34 @@ export default function Home() {
   const onlineCount=onlineIds.size;
   const inChat=!!(selUser||selGroup);
 
- if(loading) return (
-  <div className="h-screen flex items-center justify-center" style={{background:DARK.bg}}>
-    <div className="flex flex-col items-center gap-4">
-      <div className="w-14 h-14 rounded-2xl overflow-hidden">
-        <img src="/icon-192.png" alt="FamilyChat" className="w-full h-full object-cover" />
+if (loading) return (
+  <div
+    className="h-screen flex flex-col items-center justify-center gap-4"
+    style={{ background: DARK.bg }}
+  >
+    {/* Top: Icon + Title */}
+    <div className="flex items-center gap-2">
+      <img
+        src="/icon-192.png"
+        alt="FamilyChat"
+        className="object-cover"
+        style={{ width: 32, height: 32 }}
+      />
+
+      <div className="flex flex-col">
+        <h1
+          className="text-2xl font-bold leading-none"
+          style={{ fontFamily: 'Syne, sans-serif', color: T.text }}
+        >
+          FamilyChat
+        </h1>
       </div>
-      <Loader2 className="animate-spin" size={20} style={{color:'#6366f1'}}/>
     </div>
+
+    {/* Bottom: Loader */}
+    <Loader2 className="animate-spin" size={20} style={{ color: '#6366f1' }} />
   </div>
 );
-
   const card  = {background:T.bgCard,  border:`1px solid ${T.border}`};
   const card2 = {background:T.bgCard2, border:`1px solid ${T.border}`};
 
@@ -1025,16 +1042,39 @@ export default function Home() {
         <div className="flex flex-col h-full">
           <div className="px-5 pt-12 pb-4 shrink-0 t" style={{background:T.bg}}>
             <div className="flex items-center justify-between">
-              <div>
-                <h1 className="text-2xl font-bold" style={{fontFamily:'Syne,sans-serif',color:T.text}}>
-                  {activeTab==='chat'?'Messages':activeTab==='settings'?'Settings':'Profile'}
-                </h1>
-                {activeTab==='chat'&&(
-                  <p className="text-xs mt-0.5" style={{color:T.textSub}}>
-                    {isOnline?`${onlineCount} online`:'Offline · cached'}
-                  </p>
-                )}
-              </div>
+              <div className="flex items-center gap-2">
+  
+  {/* Left: Icon */}
+  <img 
+    src="/icon-192.png" 
+    alt="FamilyChat" 
+    className="object-cover"
+    style={{ width: 40, height: 40 }}
+  />
+
+  {/* Right: Title + status */}
+  <div className="flex flex-col">
+    
+    <h1 
+      className="text-2xl font-bold leading-none"
+      style={{ fontFamily: 'Syne, sans-serif', color: T.text }}
+    >
+      {activeTab === 'chat'
+        ? 'Messages'
+        : activeTab === 'settings'
+        ? 'Settings'
+        : 'Profile'}
+    </h1>
+
+    {activeTab === 'chat' && (
+      <p className="text-xs mt-0.5" style={{ color: T.textSub }}>
+        {isOnline ? `${onlineCount} online` : 'Offline'}
+      </p>
+    )}
+
+  </div>
+
+</div>
               <div className="flex items-center gap-2">
                 <ThemeToggle/>
               </div>
