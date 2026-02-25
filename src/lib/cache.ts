@@ -109,15 +109,23 @@ export const cache = {
     const all = await getAll<any>(STORES.messages);
     return all
       .filter(m =>
-        (m.sender_id === myId   && m.receiver_id === otherId) ||
+        (m.sender_id === myId    && m.receiver_id === otherId) ||
         (m.sender_id === otherId && m.receiver_id === myId)
       )
       .sort((a, b) => a.created_at.localeCompare(b.created_at));
   },
 
   getGroupMessages: async (groupId: string): Promise<any[]> => {
-    const msgs = await getByIndex<any>(STORES.messages, 'group_id', groupId);
-    return msgs.sort((a, b) => a.created_at.localeCompare(b.created_at));
+    // group_id ممکنه number یا string باشه — هر دو رو امتحان می‌کنیم
+    const [byStr, byNum] = await Promise.all([
+      getByIndex<any>(STORES.messages, 'group_id', groupId).catch(() => []),
+      getByIndex<any>(STORES.messages, 'group_id', Number(groupId)).catch(() => []),
+    ]);
+    const merged = [...byStr, ...byNum];
+    // dedup by id
+    const seen = new Set<string>();
+    const unique = merged.filter(m => { if (seen.has(m.id)) return false; seen.add(m.id); return true; });
+    return unique.sort((a, b) => a.created_at.localeCompare(b.created_at));
   },
 
   upsertMessage: async (msg: any) => {
@@ -132,7 +140,7 @@ export const cache = {
   deleteMessage: (id: string) => deleteOne(STORES.messages, id),
 
   updateMessage: async (id: string, patch: Partial<any>) => {
-    const db   = await openDB();
+    const db    = await openDB();
     const store = db.transaction(STORES.messages, 'readwrite').objectStore(STORES.messages);
     return new Promise<void>((res, rej) => {
       const getReq = store.get(id);
@@ -170,6 +178,24 @@ export const cache = {
       const req = s.clear();
       req.onsuccess = () => res();
       req.onerror   = () => rej(req.error);
+    });
+  },
+
+  // Unread counts — برای نمایش آفلاین
+  saveUnread: async (unread: Record<string, number>) => {
+    const s = await tx(STORES.meta, 'readwrite');
+    return new Promise<void>((res, rej) => {
+      const req = s.put({ key: 'unread_counts', value: unread });
+      req.onsuccess = () => res();
+      req.onerror   = () => rej(req.error);
+    });
+  },
+  getUnread: async (): Promise<Record<string, number>> => {
+    const s = await tx(STORES.meta);
+    return new Promise((res) => {
+      const req = s.get('unread_counts');
+      req.onsuccess = () => res(req.result?.value ?? {});
+      req.onerror   = () => res({});   // silent fail
     });
   },
 
