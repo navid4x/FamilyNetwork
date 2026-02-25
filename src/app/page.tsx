@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { supabase, onWsDisconnect } from '@/lib/supabase';
+import { prefetchAllMessages, prefetchAvatars } from '@/lib/prefetch';
 import { cache } from '@/lib/cache';
 import { useRouter } from 'next/navigation';
 import {
@@ -100,8 +101,15 @@ export default function Home() {
   const [editingName, setEditingName] = useState(false);
   const [newFullName, setNewFullName] = useState('');
 
-  // ── Network: فقط بر اساس وضعیت WebSocket ─────────────────────────────────
+   // ── Network state — هم ref هم state تا closure مشکل نداشته باشیم ─────────
   const [isOnline, setIsOnline] = useState(false);
+  // isOnlineRef برای استفاده داخل callback/closure‌ها — همیشه آپدیت‌شده
+  const isOnlineRef = useRef(false);
+
+  const setOnlineStatus = useCallback((val: boolean) => {
+    isOnlineRef.current = val;
+    setIsOnline(val);
+  }, []);
 
 
 
@@ -115,11 +123,16 @@ export default function Home() {
   // ref برای نگه داشتن channel تا بتونیم reconnect کنیم
   const chatChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const retryTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
-
+  // unread ref برای ذخیره در cache بدون وابستگی به state در closure
+  const unreadRef = useRef<Record<string,number>>({});
   useEffect(()=>{ selUserRef.current = selUser; },[selUser]);
   useEffect(()=>{ selGrpRef.current  = selGroup; },[selGroup]);
   useEffect(()=>{ cuRef.current      = currentUser; },[currentUser]);
-
+   // وقتی unread تغییر کنه، هم ref و هم cache رو آپدیت کن
+  useEffect(()=>{
+    unreadRef.current = unread;
+    cache.saveUnread(unread).catch(()=>{});
+  },[unread]);
   const T = dark ? DARK : LIGHT;
   const fmt  = (d:string) => new Date(d).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false});
   const fmtD = (d:string) => {
@@ -129,14 +142,17 @@ export default function Home() {
       : dt.toLocaleDateString('en-US',{month:'short',day:'numeric'});
   };
 
-  const refreshUnread = async (uid:string) => {
-    if (!isOnline) return;
-    const { data } = await supabase.from('messages').select('sender_id')
-      .eq('receiver_id',uid).eq('is_read',false);
-    const m:Record<string,number> = {};
-    data?.forEach((r:any)=>{ m[r.sender_id]=(m[r.sender_id]||0)+1; });
-    setUnread(m);
-  };
+  // refreshUnread از isOnlineRef استفاده می‌کنه نه isOnline state
+  const refreshUnread = useCallback(async (uid:string) => {
+    if (!isOnlineRef.current) return;
+    try {
+      const { data } = await supabase.from('messages').select('sender_id')
+        .eq('receiver_id',uid).eq('is_read',false);
+      const m:Record<string,number> = {};
+      data?.forEach((r:any)=>{ m[r.sender_id]=(m[r.sender_id]||0)+1; });
+      setUnread(m);
+    } catch {}
+  }, []);
 
   // Close context menu on outside click
   useEffect(()=>{
@@ -156,8 +172,12 @@ export default function Home() {
         const cachedSession = await cache.getSession().catch(()=>null);
         if (cachedSession) {
           await loadFromCache(cachedSession.userId, cachedSession.userData);
-          setIsOnline(false);
+         // unread رو از کش بخون
+          const cachedUnread = await cache.getUnread().catch(()=>({}));
+          setUnread(cachedUnread);
+          setOnlineStatus(false);
           setLoading(false);
+
           return;
         }
         router.push('/login');
@@ -167,14 +187,19 @@ export default function Home() {
       const user = session.user;
       setCU(user); cuRef.current = user;
       await cache.saveSession(user.id, user).catch(()=>{});
-
-      await loadFromCache(user.id, user);
+  // ابتدا از کش بخون (سریع)
+        await loadFromCache(user.id, user);
+   // unread رو از کش بخون
+      const cachedUnread = await cache.getUnread().catch(()=>({}));
+      setUnread(cachedUnread);
       setLoading(false);
 
-      // sync اولیه — WebSocket channel وضعیت آنلاین رو ست می‌کنه
-      await syncFromServer().catch(()=>{});
+   // sync از سرور (WebSocket وضعیت آنلاین رو ست می‌کنه)
+         await syncFromServer().catch(()=>{});
     };
     init();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+
   },[router]);
 
   // ── Load از IndexedDB ─────────────────────────────────────────────────────
@@ -223,6 +248,9 @@ export default function Home() {
     if (!cu) return;
     // اگه آفلاینیم اصلاً تلاش نکن
     if (disconnectedRef.current) return;
+        // آیا اولین sync هست؟ (برای تشخیص نیاز به prefetch)
+
+   const isFirstSync = !(await cache.getMeta('prefetched_at').catch(()=>null));
     try {
       const [{ data: profData }, { data: grpData }] = await Promise.all([
         supabase.from('profiles').select('*'),
@@ -251,6 +279,18 @@ export default function Home() {
             adminIdRef.current = adminProf.id;
             setAllowFiles(adminProf.settings_allow_files || false);
           }
+        }
+            // ── Prefetch پس‌زمینه: اولین بار یا هر بار که آنلاین میشیم ──
+        // در پس‌زمینه اجرا می‌کنیم تا UI رو block نکنه
+        const otherIds = others.map((p:any) => p.id);
+        const grpIds = (grpData || []).map((g:any) => String(g.id));
+        if (isFirstSync || true) {
+          // همیشه prefetch می‌کنیم تا پیام‌های جدید هم کش بشن
+          prefetchAllMessages(cu.id, otherIds, grpIds)
+            .then(() => cache.setMeta('prefetched_at', Date.now()))
+            .catch(() => {});
+          // عکس‌های پروفایل رو هم prefetch کن
+          prefetchAvatars(profData).catch(() => {});
         }
       }
 
@@ -342,7 +382,7 @@ export default function Home() {
         if (status === 'SUBSCRIBED') {
           const wasOffline = disconnectedRef.current;
           disconnectedRef.current = false;
-          setIsOnline(true);
+          setOnlineStatus(true);
           ch.track({ online_at: new Date().toISOString() });
           if (retryTimerRef.current) {
             clearInterval(retryTimerRef.current);
@@ -353,10 +393,8 @@ export default function Home() {
             syncFromServer().catch(()=>{});
           }
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          const reason = status === 'CHANNEL_ERROR' ? 'channel error'
-                       : status === 'TIMED_OUT'     ? 'timed out'
-                       :                              'closed';
-          goOffline(reason);
+    
+          goOffline(status);
         }
       });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -367,7 +405,7 @@ export default function Home() {
     if (disconnectedRef.current) return;
     disconnectedRef.current = true;
     connectingRef.current = false;
-    setIsOnline(false);
+    setOnlineStatus(false);
     setOnlineIds(new Set());
     console.log('[WS] disconnected');
     if (!retryTimerRef.current) {
@@ -416,7 +454,7 @@ export default function Home() {
       if (cached.length > 0) setMessages(cached);
     } catch {}
 
-    if (!isOnline) return;
+    if (!isOnlineRef.current) return;
 
     let q = supabase.from('messages').select('*');
     if (selGrpId) q=q.eq('group_id',selGrpId);
@@ -431,7 +469,7 @@ export default function Home() {
         .eq('sender_id',selUserId).eq('receiver_id',cu.id).eq('is_read',false);
       setUnread(prev=>({...prev,[selUserId]:0}));
     }
-  },[selUserId,selGrpId,isOnline]);
+  },[selUserId, selGrpId]);
   useEffect(()=>{ fetchMessages(); },[fetchMessages]);
 
   // ── Send message ───────────────────────────────────────────────────────────
@@ -619,7 +657,7 @@ export default function Home() {
 
   // ── Manual refresh ────────────────────────────────────────────────────────
   const manualSync = async () => {
-    if (!isOnline) {
+    if (!isOnlineRef.current) {
       setupChatChannel();
       return;
     }
