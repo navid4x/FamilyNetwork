@@ -664,7 +664,6 @@ export default function Home() {
           <MessageSquare className="text-white" size={28}/>
         </div>
         <Loader2 className="animate-spin" size={20} style={{color:'#6366f1'}}/>
-        <p className="text-xs" style={{color:'#4b5563'}}>Loading from cache…</p>
       </div>
     </div>
   );
