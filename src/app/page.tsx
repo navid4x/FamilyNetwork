@@ -50,6 +50,21 @@ const LIGHT = {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// ── Sticker Packs ────────────────────────────────────────────────────────────
+const STICKER_PACKS = [
+  { id: 'smileys', label: '😊', stickers: ['😀','😂','🥹','😍','🥰','😎','🤩','😭','😡','🥺','😴','🤔','🫡','🥳','😏','🙄','😬','🤯','😱','🫠'] },
+  { id: 'gestures', label: '👋', stickers: ['👍','👎','👏','🙌','🤝','✌️','🤞','👊','🫶','❤️','💔','💯','🔥','✨','🎉','🎊','💀','👻','🫂','🤌'] },
+  { id: 'animals', label: '🐶', stickers: ['🐶','🐱','🐭','🐹','🐰','🦊','🐻','🐼','🐨','🐯','🦁','🐸','🐵','🐔','🐧','🐦','🦆','🦉','🦋','🐝'] },
+];
+
+// ── Only-emoji detection ─────────────────────────────────────────────────────
+const isOnlyEmoji = (text: string) => {
+  const stripped = text.replace(/\s/g, '');
+  if (!stripped || stripped.length > 8) return false;
+  const emojiRegex = /^[\p{Emoji_Presentation}\p{Extended_Pictographic}]+$/u;
+  return emojiRegex.test(stripped);
+};
+
 export default function Home() {
   const router = useRouter();
   const [loading, setLoading]   = useState(true);
@@ -85,6 +100,10 @@ export default function Home() {
   const [editContent, setEditContent] = useState('');
   const [ctxMenu, setCtxMenu] = useState<{msg:any; x:number; y:number} | null>(null);
 
+  // ── Sticker state ────────────────────────────────────────────────────────
+  const [showStickers, setShowStickers] = useState(false);
+  const [activePack, setActivePack] = useState(0);
+
   const [showAddMember, setShowAddMember] = useState(false);
   const [editGrp, setEditGrp]   = useState<any>(null);
   const [editGrpName, setEditGrpName] = useState('');
@@ -101,17 +120,13 @@ export default function Home() {
   const [editingName, setEditingName] = useState(false);
   const [newFullName, setNewFullName] = useState('');
 
-   // ── Network state — هم ref هم state تا closure مشکل نداشته باشیم ─────────
   const [isOnline, setIsOnline] = useState(false);
-  // isOnlineRef برای استفاده داخل callback/closure‌ها — همیشه آپدیت‌شده
   const isOnlineRef = useRef(false);
 
   const setOnlineStatus = useCallback((val: boolean) => {
     isOnlineRef.current = val;
     setIsOnline(val);
   }, []);
-
-
 
   const avatarRef  = useRef<HTMLInputElement>(null);
   const scrollRef  = useRef<HTMLDivElement>(null);
@@ -120,15 +135,12 @@ export default function Home() {
   const selUserRef = useRef<any>(null);
   const selGrpRef  = useRef<any>(null);
   const cuRef      = useRef<any>(null);
-  // ref برای نگه داشتن channel تا بتونیم reconnect کنیم
   const chatChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const retryTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
-  // unread ref برای ذخیره در cache بدون وابستگی به state در closure
   const unreadRef = useRef<Record<string,number>>({});
   useEffect(()=>{ selUserRef.current = selUser; },[selUser]);
   useEffect(()=>{ selGrpRef.current  = selGroup; },[selGroup]);
   useEffect(()=>{ cuRef.current      = currentUser; },[currentUser]);
-   // وقتی unread تغییر کنه، هم ref و هم cache رو آپدیت کن
   useEffect(()=>{
     unreadRef.current = unread;
     cache.saveUnread(unread).catch(()=>{});
@@ -142,7 +154,6 @@ export default function Home() {
       : dt.toLocaleDateString('en-US',{month:'short',day:'numeric'});
   };
 
-  // refreshUnread از isOnlineRef استفاده می‌کنه نه isOnline state
   const refreshUnread = useCallback(async (uid:string) => {
     if (!isOnlineRef.current) return;
     try {
@@ -154,7 +165,6 @@ export default function Home() {
     } catch {}
   }, []);
 
-  // Close context menu on outside click
   useEffect(()=>{
     const handler = () => setCtxMenu(null);
     if (ctxMenu) {
@@ -163,7 +173,6 @@ export default function Home() {
     }
   },[ctxMenu]);
 
-  // ── INIT: ابتدا از کش بخون، بعد از سرور ──────────────────────────────────
   useEffect(()=>{
     const init = async () => {
       const { data:{session} } = await supabase.auth.getSession();
@@ -172,12 +181,10 @@ export default function Home() {
         const cachedSession = await cache.getSession().catch(()=>null);
         if (cachedSession) {
           await loadFromCache(cachedSession.userId, cachedSession.userData);
-         // unread رو از کش بخون
           const cachedUnread = await cache.getUnread().catch(()=>({}));
           setUnread(cachedUnread);
           setOnlineStatus(false);
           setLoading(false);
-
           return;
         }
         router.push('/login');
@@ -187,22 +194,16 @@ export default function Home() {
       const user = session.user;
       setCU(user); cuRef.current = user;
       await cache.saveSession(user.id, user).catch(()=>{});
-  // ابتدا از کش بخون (سریع)
-        await loadFromCache(user.id, user);
-   // unread رو از کش بخون
+      await loadFromCache(user.id, user);
       const cachedUnread = await cache.getUnread().catch(()=>({}));
       setUnread(cachedUnread);
       setLoading(false);
-
-   // sync از سرور (WebSocket وضعیت آنلاین رو ست می‌کنه)
-         await syncFromServer().catch(()=>{});
+      await syncFromServer().catch(()=>{});
     };
     init();
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   },[router]);
 
-  // ── Load از IndexedDB ─────────────────────────────────────────────────────
   const loadFromCache = async (userId: string, user: any) => {
     try {
       const [cachedProfiles, cachedGroups] = await Promise.all([
@@ -242,15 +243,12 @@ export default function Home() {
     }
   };
 
-  // ── Sync از Supabase و ذخیره در کش ───────────────────────────────────────
   const syncFromServer = async () => {
     const cu = cuRef.current;
     if (!cu) return;
-    // اگه آفلاینیم اصلاً تلاش نکن
     if (disconnectedRef.current) return;
-        // آیا اولین sync هست؟ (برای تشخیص نیاز به prefetch)
 
-   const isFirstSync = !(await cache.getMeta('prefetched_at').catch(()=>null));
+    const isFirstSync = !(await cache.getMeta('prefetched_at').catch(()=>null));
     try {
       const [{ data: profData }, { data: grpData }] = await Promise.all([
         supabase.from('profiles').select('*'),
@@ -280,16 +278,12 @@ export default function Home() {
             setAllowFiles(adminProf.settings_allow_files || false);
           }
         }
-            // ── Prefetch پس‌زمینه: اولین بار یا هر بار که آنلاین میشیم ──
-        // در پس‌زمینه اجرا می‌کنیم تا UI رو block نکنه
         const otherIds = others.map((p:any) => p.id);
         const grpIds = (grpData || []).map((g:any) => String(g.id));
         if (isFirstSync || true) {
-          // همیشه prefetch می‌کنیم تا پیام‌های جدید هم کش بشن
           prefetchAllMessages(cu.id, otherIds, grpIds)
             .then(() => cache.setMeta('prefetched_at', Date.now()))
             .catch(() => {});
-          // عکس‌های پروفایل رو هم prefetch کن
           prefetchAvatars(profData).catch(() => {});
         }
       }
@@ -305,7 +299,6 @@ export default function Home() {
     }
   };
 
-  // ── REALTIME: profiles ─────────────────────────────────────────────────────
   useEffect(()=>{
     if (!currentUser) return;
     const ch = supabase.channel('profiles-live')
@@ -324,7 +317,6 @@ export default function Home() {
     return ()=>{ supabase.removeChannel(ch); };
   },[currentUser]);
 
-  // ── REALTIME: messages + presence ─────────────────────────────────────────
   const connectingRef   = useRef(false);
   const disconnectedRef = useRef(false);
 
@@ -334,7 +326,6 @@ export default function Home() {
     if (connectingRef.current) return;
     connectingRef.current = true;
 
-    // channel قبلی رو پاک کن
     if (chatChannelRef.current) {
       try { chatChannelRef.current.untrack(); } catch {}
       supabase.removeChannel(chatChannelRef.current);
@@ -393,14 +384,12 @@ export default function Home() {
             syncFromServer().catch(()=>{});
           }
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-    
           goOffline(status);
         }
       });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // وقتی آفلاین میشیم — فقط یه بار
   const goOffline = useCallback((reason?: string) => {
     if (disconnectedRef.current) return;
     disconnectedRef.current = true;
@@ -422,7 +411,6 @@ export default function Home() {
   useEffect(()=>{
     if (!currentUser) return;
     setupChatChannel();
-    // ── بلافاصله از قطع شدن WebSocket خبردار میشیم ──
     const unsub = onWsDisconnect(() => goOffline('connection lost'));
     return ()=>{
       unsub();
@@ -439,7 +427,6 @@ export default function Home() {
 
   useEffect(()=>{ scrollRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
 
-  // ── Fetch messages: اول کش، بعد سرور ─────────────────────────────────────
   const selUserId  = selUser?.id  ?? null;
   const selGrpId   = selGroup?.id ?? null;
 
@@ -501,6 +488,16 @@ export default function Home() {
     setSending(false);
   };
 
+  // ── Send sticker ───────────────────────────────────────────────────────────
+  const sendSticker = async (emoji: string) => {
+    if (!currentUser || !isOnline) return;
+    const p: any = { content: emoji, sender_id: currentUser.id, is_sticker: true };
+    if (selGroup) p.group_id = selGroup.id;
+    else if (selUser) p.receiver_id = selUser.id;
+    await supabase.from('messages').insert([p]);
+    setShowStickers(false);
+  };
+
   // ── Delete message ─────────────────────────────────────────────────────────
   const deleteMsg = async(msg:any)=>{
     if(!currentUser||msg.sender_id!==currentUser.id) return;
@@ -533,7 +530,6 @@ export default function Home() {
 
   const cancelEdit = ()=>{ setEditingMsg(null); setEditContent(''); };
 
-  // ── Context menu ───────────────────────────────────────────────────────────
   const openCtxMenu=(e:React.MouseEvent,msg:any)=>{
     e.preventDefault();
     e.stopPropagation();
@@ -571,7 +567,6 @@ export default function Home() {
     await supabase.from('profiles').update({settings_allow_files:v}).eq('id',currentUser.id);
   };
 
-  // ── Group CRUD ─────────────────────────────────────────────────────────────
   const openEditGrp=async(g:any)=>{
     setEditGrp(g); setEditGrpName(g.name);
     const {data}=await supabase.from('group_members').select('user_id').eq('group_id',g.id);
@@ -616,7 +611,6 @@ export default function Home() {
     await cache.saveGroups(newGroups).catch(()=>{});
   };
 
-  // ── User CRUD ──────────────────────────────────────────────────────────────
   const openEditUsr=(u:any)=>{ setEditUsr(u); setEditUsrName(u.full_name||''); setEditUsrAdmin(u.is_admin||false); };
 
   const saveUsr=async()=>{
@@ -655,7 +649,6 @@ export default function Home() {
     else alert(error.message);
   };
 
-  // ── Manual refresh ────────────────────────────────────────────────────────
   const manualSync = async () => {
     if (!isOnlineRef.current) {
       setupChatChannel();
@@ -665,9 +658,8 @@ export default function Home() {
     await fetchMessages();
   };
 
-  // ── Message search ─────────────────────────────────────────────────────────
   const filteredMsgs = msgSearch.trim()
-    ? messages.filter(m=>!m.is_image && (m.content||'').toLowerCase().includes(msgSearch.toLowerCase()))
+    ? messages.filter(m=>!m.is_image && !m.is_sticker && (m.content||'').toLowerCase().includes(msgSearch.toLowerCase()))
     : messages;
 
   const highlight=(text:string)=>{
@@ -684,7 +676,7 @@ export default function Home() {
       ? 'You'
       : (users.find((u:any)=>u.id===orig.sender_id)?.full_name || 'Unknown');
     return {
-      text: orig.is_image ? '📷 Photo' : (orig.content||'').slice(0,60)+(orig.content?.length>60?'…':''),
+      text: orig.is_image ? '📷 Photo' : orig.is_sticker ? orig.content : (orig.content||'').slice(0,60)+(orig.content?.length>60?'…':''),
       senderName: sender,
       isImage: orig.is_image,
     };
@@ -699,7 +691,6 @@ if (loading) return (
     className="h-screen flex flex-col items-center justify-center gap-4"
     style={{ background: DARK.bg }}
   >
-    {/* Top: Icon + Title */}
     <div className="flex items-center gap-2">
       <img
         src="/icon-192.png"
@@ -707,18 +698,15 @@ if (loading) return (
         className="object-cover"
         style={{ width: 32, height: 32 }}
       />
-
       <div className="flex flex-col">
         <h1
           className="text-2xl font-bold leading-none"
-          style={{ fontFamily: 'Syne, sans-serif', color: T.text }}
+          style={{ fontFamily: 'Syne, sans-serif', color: DARK.text }}
         >
           FamilyChat
         </h1>
       </div>
     </div>
-
-    {/* Bottom: Loader */}
     <Loader2 className="animate-spin" size={20} style={{ color: '#6366f1' }} />
   </div>
 );
@@ -777,7 +765,7 @@ if (loading) return (
           <div className="flex-1 min-w-0">
             <p className="text-xs font-semibold" style={{color:'#818cf8'}}>{senderName}</p>
             <p className="text-xs truncate" style={{color:T.textSub}}>
-              {replyTo.is_image?'📷 Photo':replyTo.content?.slice(0,80)}
+              {replyTo.is_image?'📷 Photo':replyTo.is_sticker?replyTo.content:replyTo.content?.slice(0,80)}
             </p>
           </div>
           <button onClick={()=>setReplyTo(null)} className="shrink-0 p-1"><X size={13} style={{color:T.textSub}}/></button>
@@ -800,7 +788,38 @@ if (loading) return (
     );
   };
 
-
+  // ── Sticker Panel ──────────────────────────────────────────────────────────
+  const StickerPanel=()=>{
+    if(!showStickers||editingMsg) return null;
+    return (
+      <div className="shrink-0 t" style={{background:T.header,borderTop:`1px solid ${T.border}`}}>
+        {/* Pack tabs */}
+        <div className="flex gap-1 px-3 pt-2 pb-1">
+          {STICKER_PACKS.map((pack,i)=>(
+            <button key={pack.id} onClick={()=>setActivePack(i)}
+              className="w-9 h-9 rounded-xl flex items-center justify-center text-xl transition-all"
+              style={{
+                background: activePack===i
+                  ? (dark?'rgba(129,140,248,0.2)':'rgba(79,70,229,0.1)')
+                  : 'transparent',
+                border: activePack===i ? `1px solid ${T.border2}` : '1px solid transparent',
+              }}>
+              {pack.label}
+            </button>
+          ))}
+        </div>
+        {/* Sticker grid */}
+        <div className="grid grid-cols-8 gap-0.5 px-3 pb-3 overflow-y-auto" style={{maxHeight:170}}>
+          {STICKER_PACKS[activePack].stickers.map((s,i)=>(
+            <button key={i} onClick={()=>sendSticker(s)}
+              className="w-10 h-10 rounded-xl flex items-center justify-center text-2xl sticker-btn">
+              {s}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="flex flex-col h-screen overflow-hidden"
@@ -824,6 +843,9 @@ if (loading) return (
           box-shadow:0 8px 32px rgba(0,0,0,0.3);min-width:160px;}
         .ctx-item{display:flex;align-items:center;gap:10px;padding:11px 16px;
           font-size:13px;cursor:pointer;transition:background 0.12s;}
+        .sticker-btn{transition:transform 0.12s ease;} 
+        .sticker-btn:hover{transform:scale(1.2);}
+        .sticker-btn:active{transform:scale(0.95);}
       `}</style>
 
       {/* ═══════════ CONTEXT MENU ══════════════════════════════════════ */}
@@ -835,7 +857,7 @@ if (loading) return (
             onClick={()=>{ setReplyTo(ctxMenu.msg); setCtxMenu(null); inputRef.current?.focus(); }}>
             <Reply size={15}/> Reply
           </div>
-          {currentUser&&ctxMenu.msg.sender_id===currentUser.id&&!ctxMenu.msg.is_image&&(
+          {currentUser&&ctxMenu.msg.sender_id===currentUser.id&&!ctxMenu.msg.is_image&&!ctxMenu.msg.is_sticker&&(
             <div className="ctx-item" style={{color:'#14b8a6'}}
               onClick={()=>startEdit(ctxMenu.msg)}>
               <Pencil size={15}/> Edit
@@ -855,7 +877,7 @@ if (loading) return (
         <div className="flex flex-col h-full">
           <div className="flex items-center gap-3 px-4 py-3 shrink-0 t"
             style={{background:T.header,borderBottom:`1px solid ${T.border}`,backdropFilter:'blur(20px)'}}>
-            <button onClick={()=>{setSelUser(null);setSelGroup(null);setMediaPrev(null);setSearchOpen(false);setMsgSearch('');setReplyTo(null);setEditingMsg(null);}}
+            <button onClick={()=>{setSelUser(null);setSelGroup(null);setMediaPrev(null);setSearchOpen(false);setMsgSearch('');setReplyTo(null);setEditingMsg(null);setShowStickers(false);}}
               className="p-2 rounded-xl shrink-0 t" style={{background:dark?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.06)'}}>
               <ChevronLeft size={20} style={{color:'#818cf8'}}/>
             </button>
@@ -900,7 +922,7 @@ if (loading) return (
 
           {/* Messages */}
           <div className="flex-1 overflow-y-auto px-4 py-4 t" style={{background:T.bg}}
-            onClick={()=>ctxMenu&&setCtxMenu(null)}>
+            onClick={()=>{ if(ctxMenu) setCtxMenu(null); if(showStickers) setShowStickers(false); }}>
             {messages.length===0&&(
               <div className="flex flex-col items-center justify-center h-full gap-2 opacity-30">
                 <MessageSquare size={32} style={{color:T.textSub}}/>
@@ -919,6 +941,8 @@ if (loading) return (
               const isMe   = !!currentUser&&msg.sender_id===currentUser.id;
               const showDt = idx===0||fmtD(filteredMsgs[idx-1].created_at)!==fmtD(msg.created_at);
               const isImg  = msg.is_image;
+              const isSticker = msg.is_sticker;
+              const onlyEmoji = !isImg && !isSticker && isOnlyEmoji(msg.content || '');
               const sender = users.find((u:any)=>u.id===msg.sender_id);
               const replyPrev = getReplyPreview(msg);
 
@@ -931,7 +955,7 @@ if (loading) return (
                     </div>
                   )}
                   <div className={`flex mb-1.5 ${isMe?'justify-end':'justify-start'} items-end gap-1`}>
-                    {isMe&&(
+                    {isMe&&!isSticker&&(
                       <div className="msg-actions flex items-center gap-1 mb-1">
                         <button onClick={(e)=>openCtxMenu(e,msg)}
                           className="p-1.5 rounded-lg"
@@ -948,46 +972,72 @@ if (loading) return (
                           <p className="text-xs truncate" style={{color:T.textSub}}>{replyPrev.text}</p>
                         </div>
                       )}
-                      <div
-                        onContextMenu={(e)=>openCtxMenu(e,msg)}
-                        style={{
-                          padding:isImg?'6px':'10px 14px',
-                          borderRadius:isMe?'18px 18px 4px 18px':'18px 18px 18px 4px',
-                          background:isMe?'linear-gradient(135deg,#4f46e5,#7c3aed)':T.msgIn,
-                          border:isMe?'none':T.msgInBorder,
-                          cursor:'context-menu',
-                        }}>
-                        {selGroup&&!isMe&&(
-                          <p className="text-xs font-semibold mb-1" style={{color:'#818cf8'}}>
-                            {sender?.full_name||sender?.username?.split('@')[0]||''}
-                          </p>
-                        )}
-                        {isImg?(
-                          <div className="rounded-xl overflow-hidden">
-                            {/\.(mp4|webm|mov)$/i.test(msg.content)
-                              ?<video src={msg.content} controls className="max-w-full rounded-xl" style={{maxHeight:220}}/>
-                              :<img src={msg.content} className="max-w-full rounded-xl" style={{maxHeight:220,display:'block'}} alt="media"/>}
-                            <div className={`flex items-center gap-1 mt-1 px-1 pb-1 ${isMe?'justify-end':'justify-start'}`}>
-                              <span className="text-[10px]" style={{color:isMe?'rgba(255,255,255,0.5)':T.msgTimeIn}}>{fmt(msg.created_at)}</span>
-                              {isMe&&(msg.is_read?<CheckCheck size={13} style={{color:'#a5b4fc'}}/>:<Check size={13} style={{color:'rgba(255,255,255,0.35)'}}/>)}
-                            </div>
-                          </div>
-                        ):(
-                          <>
-                            <p className="text-sm leading-relaxed break-words"
-                              style={{color:isMe?'#fff':T.msgInText}}
-                              dangerouslySetInnerHTML={{__html:highlight(msg.content||'')}}>
+
+                      {/* ── Sticker bubble (no background) ── */}
+                      {isSticker ? (
+                        <div
+                          onContextMenu={(e)=>openCtxMenu(e,msg)}
+                          style={{cursor:'context-menu',padding:'2px 4px'}}>
+                          {selGroup&&!isMe&&(
+                            <p className="text-xs font-semibold mb-1" style={{color:'#818cf8'}}>
+                              {sender?.full_name||sender?.username?.split('@')[0]||''}
                             </p>
-                            <div className={`flex items-center gap-1 mt-1 ${isMe?'justify-end':'justify-start'}`}>
-                              {msg.edited_at&&(
-                                <span className="text-[9px] italic" style={{color:isMe?'rgba(255,255,255,0.4)':T.msgTimeIn}}>edited</span>
-                              )}
-                              <span className="text-[10px]" style={{color:isMe?'rgba(255,255,255,0.45)':T.msgTimeIn}}>{fmt(msg.created_at)}</span>
-                              {isMe&&(msg.is_read?<CheckCheck size={13} style={{color:'#a5b4fc'}}/>:<Check size={13} style={{color:'rgba(255,255,255,0.35)'}}/>)}
+                          )}
+                          <div style={{fontSize:'3rem',lineHeight:1.1}}>
+                            {msg.content}
+                          </div>
+                          <div className={`flex items-center gap-1 mt-0.5 ${isMe?'justify-end':'justify-start'}`}>
+                            <span className="text-[10px]" style={{color:T.msgTimeIn}}>{fmt(msg.created_at)}</span>
+                            {isMe&&(msg.is_read?<CheckCheck size={13} style={{color:'#818cf8'}}/>:<Check size={13} style={{color:T.textMuted}}/>)}
+                          </div>
+                        </div>
+                      ) : (
+                        <div
+                          onContextMenu={(e)=>openCtxMenu(e,msg)}
+                          style={{
+                            padding:isImg?'6px':'10px 14px',
+                            borderRadius:isMe?'18px 18px 4px 18px':'18px 18px 18px 4px',
+                            background:isMe?'linear-gradient(135deg,#4f46e5,#7c3aed)':T.msgIn,
+                            border:isMe?'none':T.msgInBorder,
+                            cursor:'context-menu',
+                          }}>
+                          {selGroup&&!isMe&&(
+                            <p className="text-xs font-semibold mb-1" style={{color:'#818cf8'}}>
+                              {sender?.full_name||sender?.username?.split('@')[0]||''}
+                            </p>
+                          )}
+                          {isImg?(
+                            <div className="rounded-xl overflow-hidden">
+                              {/\.(mp4|webm|mov)$/i.test(msg.content)
+                                ?<video src={msg.content} controls className="max-w-full rounded-xl" style={{maxHeight:220}}/>
+                                :<img src={msg.content} className="max-w-full rounded-xl" style={{maxHeight:220,display:'block'}} alt="media"/>}
+                              <div className={`flex items-center gap-1 mt-1 px-1 pb-1 ${isMe?'justify-end':'justify-start'}`}>
+                                <span className="text-[10px]" style={{color:isMe?'rgba(255,255,255,0.5)':T.msgTimeIn}}>{fmt(msg.created_at)}</span>
+                                {isMe&&(msg.is_read?<CheckCheck size={13} style={{color:'#a5b4fc'}}/>:<Check size={13} style={{color:'rgba(255,255,255,0.35)'}}/>)}
+                              </div>
                             </div>
-                          </>
-                        )}
-                      </div>
+                          ):(
+                            <>
+                              <p
+                                className="leading-relaxed break-words"
+                                style={{
+                                  color:isMe?'#fff':T.msgInText,
+                                  fontSize: onlyEmoji ? '2.5rem' : '0.875rem',
+                                  lineHeight: onlyEmoji ? '1.15' : undefined,
+                                }}
+                                dangerouslySetInnerHTML={{__html:highlight(msg.content||'')}}>
+                              </p>
+                              <div className={`flex items-center gap-1 mt-1 ${isMe?'justify-end':'justify-start'}`}>
+                                {msg.edited_at&&(
+                                  <span className="text-[9px] italic" style={{color:isMe?'rgba(255,255,255,0.4)':T.msgTimeIn}}>edited</span>
+                                )}
+                                <span className="text-[10px]" style={{color:isMe?'rgba(255,255,255,0.45)':T.msgTimeIn}}>{fmt(msg.created_at)}</span>
+                                {isMe&&(msg.is_read?<CheckCheck size={13} style={{color:'#a5b4fc'}}/>:<Check size={13} style={{color:'rgba(255,255,255,0.35)'}}/>)}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
                     </div>
                     {!isMe&&(
                       <div className="msg-actions flex items-center gap-1 mb-1">
@@ -1007,6 +1057,9 @@ if (loading) return (
 
           <EditBar/>
           {!editingMsg&&<ReplyBar/>}
+
+          {/* Sticker Panel — above media preview */}
+          <StickerPanel/>
 
           {mediaPrev&&(
             <div className="px-4 pt-2 shrink-0 t" style={{background:T.header,borderTop:`1px solid ${T.border}`}}>
@@ -1047,16 +1100,7 @@ if (loading) return (
               </form>
             ):(
               <form onSubmit={sendMsg} className="flex items-center gap-2">
-                {allowFiles&&(
-                  <>
-                    <input ref={fileRef} type="file" accept="image/*,video/*" onChange={onFileChange} className="hidden"/>
-                    <button type="button" onClick={()=>fileRef.current?.click()}
-                      className="w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 t"
-                      style={{background:mediaPrev?'linear-gradient(135deg,#4f46e5,#7c3aed)':(dark?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.06)'),border:`1px solid ${T.border}`}}>
-                      <FileImage size={18} style={{color:mediaPrev?'#fff':'#818cf8'}}/>
-                    </button>
-                  </>
-                )}
+                {/* Input field */}
                 <div className="flex-1 flex items-center px-4 rounded-2xl t"
                   style={{background:T.inputBg,border:`1px solid ${T.border2}`,minHeight:'48px'}}>
                   <input ref={inputRef} value={newMsg} onChange={e=>setNewMsg(e.target.value)}
@@ -1064,6 +1108,39 @@ if (loading) return (
                     disabled={!isOnline}
                     className="flex-1 bg-transparent text-sm py-3 t" style={{color:T.text,border:'none'}}/>
                 </div>
+
+                {/* Sticker button */}
+                <button type="button"
+                  onClick={()=>{ setShowStickers(s=>!s); }}
+                  disabled={!isOnline}
+                  className="sb w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 t"
+                  style={{
+                    background: showStickers
+                      ? 'linear-gradient(135deg,#4f46e5,#7c3aed)'
+                      : (dark?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.06)'),
+                    border:`1px solid ${T.border}`,
+                    fontSize: 20,
+                    opacity: isOnline ? 1 : 0.4,
+                  }}>
+                  😊
+                </button>
+
+                {/* Media button — now on the right */}
+                {allowFiles&&(
+                  <>
+                    <input ref={fileRef} type="file" accept="image/*,video/*" onChange={onFileChange} className="hidden"/>
+                    <button type="button" onClick={()=>fileRef.current?.click()}
+                      className="sb w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 t"
+                      style={{
+                        background:mediaPrev?'linear-gradient(135deg,#4f46e5,#7c3aed)':(dark?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.06)'),
+                        border:`1px solid ${T.border}`,
+                      }}>
+                      <FileImage size={18} style={{color:mediaPrev?'#fff':'#818cf8'}}/>
+                    </button>
+                  </>
+                )}
+
+                {/* Send button */}
                 <button type="submit" disabled={sending||!isOnline} className="sb w-12 h-12 rounded-2xl flex items-center justify-center shrink-0"
                   style={{background:(newMsg.trim()||mediaPrev)&&isOnline?'linear-gradient(135deg,#4f46e5,#7c3aed)':(dark?'rgba(255,255,255,0.07)':'rgba(0,0,0,0.06)')}}>
                   {sending?<Loader2 size={18} className="animate-spin text-white"/>
@@ -1081,38 +1158,30 @@ if (loading) return (
           <div className="px-5 pt-12 pb-4 shrink-0 t" style={{background:T.bg}}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-  
-  {/* Left: Icon */}
-  <img 
-    src="/icon-192.png" 
-    alt="FamilyChat" 
-    className="object-cover"
-    style={{ width: 40, height: 40 }}
-  />
-
-  {/* Right: Title + status */}
-  <div className="flex flex-col">
-    
-    <h1 
-      className="text-2xl font-bold leading-none"
-      style={{ fontFamily: 'Syne, sans-serif', color: T.text }}
-    >
-      {activeTab === 'chat'
-        ? 'Messages'
-        : activeTab === 'settings'
-        ? 'Settings'
-        : 'Profile'}
-    </h1>
-
-    {activeTab === 'chat' && (
-      <p className="text-xs mt-0.5" style={{ color: T.textSub }}>
-        {isOnline ? `${onlineCount} online` : 'Offline'}
-      </p>
-    )}
-
-  </div>
-
-</div>
+                <img
+                  src="/icon-192.png"
+                  alt="FamilyChat"
+                  className="object-cover"
+                  style={{ width: 40, height: 40 }}
+                />
+                <div className="flex flex-col">
+                  <h1
+                    className="text-2xl font-bold leading-none"
+                    style={{ fontFamily: 'Syne, sans-serif', color: T.text }}
+                  >
+                    {activeTab === 'chat'
+                      ? 'Messages'
+                      : activeTab === 'settings'
+                      ? 'Settings'
+                      : 'Profile'}
+                  </h1>
+                  {activeTab === 'chat' && (
+                    <p className="text-xs mt-0.5" style={{ color: T.textSub }}>
+                      {isOnline ? `${onlineCount} online` : 'Offline'}
+                    </p>
+                  )}
+                </div>
+              </div>
               <div className="flex items-center gap-2">
                 <ThemeToggle/>
               </div>
